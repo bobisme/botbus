@@ -87,9 +87,16 @@ pub fn run(options: HistoryOptions) -> Result<()> {
                     }
                     std::io::stdout().flush()?;
                 }
-                // Continue streaming new messages as JSONL
+                // Continue streaming new messages as JSONL. Seed the follow
+                // cursor from the bounded read's next_offset so messages between
+                // that read and EOF are not skipped.
                 let path = channel_path(&channel);
-                follow_channel_json(&path, options.timeout, options.follow_count)?;
+                follow_channel_json(
+                    &path,
+                    output.next_offset,
+                    options.timeout,
+                    options.follow_count,
+                )?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             }
@@ -130,7 +137,12 @@ pub fn run(options: HistoryOptions) -> Result<()> {
             // Follow mode
             if options.follow {
                 let path = channel_path(&channel);
-                follow_channel(&path, options.timeout, options.follow_count)?;
+                follow_channel(
+                    &path,
+                    output.next_offset,
+                    options.timeout,
+                    options.follow_count,
+                )?;
             }
         }
         OutputFormat::Text => {
@@ -147,7 +159,12 @@ pub fn run(options: HistoryOptions) -> Result<()> {
             // Follow mode
             if options.follow {
                 let path = channel_path(&channel);
-                follow_channel(&path, options.timeout, options.follow_count)?;
+                follow_channel(
+                    &path,
+                    output.next_offset,
+                    options.timeout,
+                    options.follow_count,
+                )?;
             }
         }
     }
@@ -417,6 +434,7 @@ fn format_time_ago(ts: DateTime<Utc>) -> String {
 
 fn follow_channel_json(
     path: &Path,
+    start_offset: u64,
     timeout_secs: Option<u64>,
     follow_count: Option<usize>,
 ) -> Result<()> {
@@ -427,11 +445,33 @@ fn follow_channel_json(
     use std::time::{Duration, Instant};
 
     let channels = channels_dir();
+    // Register the watcher before draining so any message written after the
+    // drain is guaranteed to produce an event the loop will pick up.
     let (_watcher, rx) = watch_directory(&channels)?;
 
-    let mut offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Seed the cursor from the caller's offset (the initial bounded read's
+    // next_offset), not the file's current EOF. Seeding from EOF would skip
+    // messages that landed between the bounded read and EOF.
+    let mut offset = start_offset;
     let start = Instant::now();
     let mut messages_received: usize = 0;
+
+    // Drain any startup backlog already present between the seed offset and EOF
+    // so it is delivered immediately rather than waiting for the next event.
+    {
+        let (backlog, new_offset) = read_messages_from_offset(path, offset)?;
+        for msg in &backlog {
+            println!("{}", serde_json::to_string(msg)?);
+            std::io::stdout().flush()?;
+            messages_received += 1;
+            if let Some(max_count) = follow_count
+                && messages_received >= max_count
+            {
+                return Ok(());
+            }
+        }
+        offset = new_offset;
+    }
 
     loop {
         if let Some(timeout) = timeout_secs
@@ -472,6 +512,7 @@ fn follow_channel_json(
 
 fn follow_channel(
     path: &Path,
+    start_offset: u64,
     timeout_secs: Option<u64>,
     follow_count: Option<usize>,
 ) -> Result<()> {
@@ -483,14 +524,37 @@ fn follow_channel(
     println!("{}", "--- Following (Ctrl+C to exit) ---".dimmed());
 
     let channels = channels_dir();
+    // Register the watcher before draining so any message written after the
+    // drain is guaranteed to produce an event the loop will pick up.
     let (_watcher, rx) = watch_directory(&channels)?;
 
-    // Track our position in the file
-    let mut offset = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Seed the cursor from the caller's offset (the initial read's next_offset),
+    // not the file's current EOF, so messages between the initial read and EOF
+    // are not skipped.
+    let mut offset = start_offset;
 
     // Track timeout and message count
     let start = Instant::now();
     let mut messages_received: usize = 0;
+
+    // Drain any startup backlog already present between the seed offset and EOF.
+    {
+        let (backlog, new_offset) = read_messages_from_offset(path, offset)?;
+        for msg in &backlog {
+            print_message(msg);
+            messages_received += 1;
+            if let Some(max_count) = follow_count
+                && messages_received >= max_count
+            {
+                println!(
+                    "{}",
+                    format!("--- Received {} messages ---", max_count).dimmed()
+                );
+                return Ok(());
+            }
+        }
+        offset = new_offset;
+    }
 
     loop {
         // Check timeout
