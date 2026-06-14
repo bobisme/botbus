@@ -274,6 +274,52 @@ pub fn read_messages_from_offset_limited(
     Ok((filter_deleted(all), new_offset))
 }
 
+/// Byte offset immediately after the message with the given `id`.
+///
+/// Uses the same cursor semantics as [`read_messages_from_offset`], so the
+/// returned value can be passed straight back as a continuation offset. Scans
+/// raw records (including tombstones) so a since-deleted id can still anchor
+/// pagination. Returns `None` if no record with that id exists in the file.
+pub fn offset_after_message_id(path: &Path, id: &str) -> anyhow::Result<Option<u64>> {
+    use anyhow::Context;
+    use std::io::{BufRead, BufReader, Seek};
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open file: {}", path.display()))?;
+    file.lock_shared()
+        .with_context(|| format!("Failed to acquire shared lock on: {}", path.display()))?;
+
+    let mut reader = BufReader::new(&file);
+    loop {
+        let mut line = String::new();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("Failed to read from: {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        // Cursor position after this line, matching read_records_from_offset.
+        let pos = reader.stream_position()?;
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let msg: Message = serde_json::from_str(line.trim())
+            .with_context(|| format!("Failed to parse in {}: {}", path.display(), line))?;
+        if msg.id.to_string() == id {
+            return Ok(Some(pos));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Filter out deleted messages and their tombstones from a vec of messages.
 fn filter_deleted(messages: Vec<Message>) -> Vec<Message> {
     // Pass 1: collect all tombstone target IDs
@@ -339,6 +385,33 @@ mod tests {
         assert_eq!(msg.body, parsed.body);
         assert_eq!(msg.agent, parsed.agent);
         assert_eq!(msg.channel, parsed.channel);
+    }
+
+    #[test]
+    fn test_offset_after_message_id() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("channel.jsonl");
+        let m1 = Message::new("agent", "channel", "one");
+        let m2 = Message::new("agent", "channel", "two");
+        crate::storage::jsonl::append_record(&path, &m1).unwrap();
+        crate::storage::jsonl::append_record(&path, &m2).unwrap();
+
+        // The offset after m1 is a continuation cursor: reading from it yields m2.
+        let offset = offset_after_message_id(&path, &m1.id.to_string())
+            .unwrap()
+            .expect("m1 should be found");
+        let (rest, _) = read_messages_from_offset(&path, offset).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].body, "two");
+
+        // Unknown id → None.
+        assert!(
+            offset_after_message_id(&path, &Ulid::nil().to_string())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

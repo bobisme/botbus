@@ -210,27 +210,28 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
     // Get file size for next_offset calculation
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
+    // Resolve --after-id to a byte offset so it shares the lossless offset-based
+    // read path. Routing it through read_messages_from_offset_limited keeps
+    // next_offset pointing at the true continuation cursor (immediately after the
+    // last returned message). The old after-id path returned EOF as next_offset,
+    // so paginating with --after-offset would skip every message between the
+    // count-th returned message and EOF.
+    let start_offset = match (options.after_offset, &options.after_id) {
+        (Some(offset), _) => Some(offset),
+        (None, Some(after_id)) => {
+            // Unknown id falls back to offset 0 (read from the beginning), which
+            // matches the previous "id not found → return from start" behavior.
+            Some(crate::core::message::offset_after_message_id(&path, after_id)?.unwrap_or(0))
+        }
+        (None, None) => None,
+    };
+
     // Read messages based on options
-    let (messages, next_offset) = if let Some(offset) = options.after_offset {
-        // Read from specific offset
-        let (msgs, new_offset): (Vec<Message>, u64) =
-            read_messages_from_offset_limited(&path, offset, options.count)
-                .with_context(|| format!("Failed to read channel #{} from offset", channel))?;
-        (msgs, new_offset)
-    } else if let Some(after_id) = &options.after_id {
-        // Read all and filter to messages after the given ID
-        let all: Vec<Message> =
-            read_messages(&path).with_context(|| format!("Failed to read channel #{}", channel))?;
-
-        // Find the position of the after_id message
-        let start_idx = all
-            .iter()
-            .position(|m| m.id.to_string() == *after_id)
-            .map(|i| i + 1) // Start after the found message
-            .unwrap_or(0); // If not found, return all messages
-
-        let msgs: Vec<Message> = all.into_iter().skip(start_idx).collect();
-        (msgs, file_size)
+    let (messages, next_offset) = if let Some(offset) = start_offset {
+        // Bounded read from a byte offset; next_offset is a valid continuation
+        // cursor whether or not the result hit the count limit.
+        read_messages_from_offset_limited(&path, offset, options.count)
+            .with_context(|| format!("Failed to read channel #{} from offset", channel))?
     } else if options.since.is_some()
         || options.before.is_some()
         || options.from.is_some()
@@ -247,23 +248,13 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
         (msgs, file_size)
     };
 
-    // Track total available before applying count limit
     let total_available = messages.len();
-
-    // Apply count limit if we used after_id. after_offset reads are already
-    // bounded so next_offset remains a valid continuation cursor.
-    let messages = if options.after_id.is_some() && messages.len() > options.count {
-        messages.into_iter().take(options.count).collect()
-    } else {
-        messages
-    };
-
     let last_id = messages.last().map(|m| m.id.to_string());
 
-    // Build advice
+    // Build advice. For offset-based reads, more messages remain when the
+    // continuation cursor hasn't reached EOF yet.
     let mut advice = Vec::new();
-    if total_available > messages.len() {
-        // There are more messages to read
+    if start_offset.is_some() && next_offset < file_size {
         advice.push(format!(
             "rite history {} --after-offset {}",
             options.channel.as_ref().unwrap_or(&"general".to_string()),
@@ -761,6 +752,69 @@ mod tests {
         .unwrap();
         assert_eq!(second_page.messages.len(), 1);
         assert_eq!(second_page.messages[0].body, "Message 2");
+    }
+
+    #[test]
+    #[serial]
+    fn test_after_id_pagination_does_not_skip_after_count_limit() {
+        let _env = TestEnv::new();
+        for i in 1..=4 {
+            send::run_simple(
+                "test-after-id".to_string(),
+                format!("Message {i}"),
+                Some("test-historian"),
+            )
+            .unwrap();
+        }
+
+        let base = HistoryOptions {
+            channel: Some("test-after-id".to_string()),
+            count: 50,
+            follow: false,
+            timeout: None,
+            follow_count: None,
+            since: None,
+            before: None,
+            from: None,
+            labels: vec![],
+            after_offset: None,
+            after_id: None,
+            show_offset: false,
+            format: OutputFormat::Text,
+            agent: None,
+        };
+
+        // Grab the id of the first message.
+        let all = run_with_output(base.clone()).unwrap();
+        assert_eq!(all.messages.len(), 4);
+        let first_id = all.messages[0].id.to_string();
+
+        // Page after the first message, limited to 1 → "Message 2", and the
+        // continuation cursor must point just past it, not at EOF.
+        let page1 = run_with_output(HistoryOptions {
+            after_id: Some(first_id),
+            count: 1,
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(page1.messages.len(), 1);
+        assert_eq!(page1.messages[0].body, "Message 2");
+        let file_size = std::fs::metadata(channel_path("test-after-id"))
+            .unwrap()
+            .len();
+        assert!(
+            page1.next_offset < file_size,
+            "after-id next_offset must be a continuation cursor, not EOF"
+        );
+
+        // Continuing from that cursor must yield messages 3 and 4, not skip them.
+        let page2 = run_with_output(HistoryOptions {
+            after_offset: Some(page1.next_offset),
+            ..base
+        })
+        .unwrap();
+        let bodies: Vec<String> = page2.messages.iter().map(|m| m.body.clone()).collect();
+        assert_eq!(bodies, vec!["Message 3", "Message 4"]);
     }
 
     #[test]
