@@ -10,3 +10,7 @@ opencode.json
 
 # maw agent workspaces
 ws/
+# maw admin tree (consolidated layout) — runtime/admin only
+/.maw/
+/.manifold/
+/repo.git/
