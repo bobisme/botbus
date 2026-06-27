@@ -1,6 +1,0 @@
-{"ts":"2026-01-24T02:22:14.078479562Z","name":"Coordinator","description":"Main coordinator agent","event":"registered"}
-{"ts":"2026-01-24T02:22:45.485026094Z","name":"StorageFixer","description":"Fixes storage layer race conditions","event":"registered"}
-{"ts":"2026-01-24T02:22:54.672575507Z","name":"CLIAgent","description":"Improves CLI commands","event":"registered"}
-{"ts":"2026-01-24T02:23:03.245418528Z","name":"EnhancementAgent","description":"Adds new features","event":"registered"}
-{"ts":"2026-01-24T02:23:13.217560126Z","name":"TestAgent","description":"Improves test coverage","event":"registered"}
-{"ts":"2026-01-24T02:23:23.182240933Z","name":"TUIAgent","description":"Improves TUI","event":"registered"}
