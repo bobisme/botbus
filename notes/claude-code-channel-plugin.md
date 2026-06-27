@@ -46,13 +46,34 @@ Multiple agents can watch the same rite channel simultaneously. Each Claude Code
 
 ## Channel Selection
 
-Watch channels from three sources, merged and deduplicated:
+The server runs in one of two selection modes. Both always include the agent's
+own DM channels, and both always drop self-authored messages.
 
-1. Always: the agent's own DM target(s)
-2. Explicit config: `RITE_CHANNELS` env var (comma-separated)
-3. Optional auto-discovery: `rite subscriptions list --format json`
+### Explicit mode (default)
 
-Example: an agent working on the `rite` project sets `RITE_CHANNELS=rite` and receives both project-channel traffic and direct messages.
+Watch a fixed set, merged and deduplicated:
+
+1. Always: DM channels whose participants include the current agent — existing
+   `_dm_*` files plus newly-created ones (see Watching Mechanism).
+2. Explicit config: `RITE_CHANNELS` env var (comma-separated project channels).
+
+Every message on a watched channel is forwarded — this is broadcast: you see all
+traffic on the channels you subscribed to. Subscription auto-discovery
+(`rite subscriptions list`) is deferred until rite grows `--format json` for it;
+do not parse colored text (see Disposition #3).
+
+Example: an agent working on the `rite` project sets `RITE_CHANNELS=rite` and
+receives both project-channel traffic and direct messages.
+
+### Mention mode (opt-in: `RITE_MENTION_ROUTING=1`)
+
+Watch *every* channel, but forward only messages that concern the agent. This is
+what makes `@<agent> hello` reach the agent from **any** channel, without having
+to subscribe to each one. See [Mention Routing](#mention-routing).
+
+Example: `rite-dev` sets `RITE_MENTION_ROUTING=1` and becomes reachable as
+`@rite-dev` in any channel — plus its DMs — without enumerating channels in
+`RITE_CHANNELS`.
 
 ## Identity
 
@@ -74,6 +95,15 @@ rite history <channel> --format json -f --after-offset <offset>
 
 This emits one compact `Message` JSON object per line as messages arrive. The server reads stdout line-by-line, parses JSONL, and emits Claude channel notifications.
 
+In **explicit mode** the watched set is `RITE_CHANNELS` plus the agent's DM
+channels. In **mention mode** the watched set is *every* channel file in
+`channels_dir()` (project channels and `_dm_*` alike); the same one-subprocess-
+per-channel mechanism is used, only the channel list is wider. Either way, watch
+the channels directory for newly-created channel files and spawn a follower for
+each as it appears (first DMs — and, in mention mode, brand-new channels — can
+arrive after startup). Newly-created files are seeded from offset 0 so a
+channel's very first message is not missed.
+
 ### Startup offset
 
 Before spawning the follow process, ask rite for the current end offset and start from there so the channel only delivers messages that arrive after the Claude session opens:
@@ -84,15 +114,124 @@ rite history <channel> --format json -n 1 --show-offset
 
 Parse `next_offset` from the JSON response and pass it to `--after-offset`.
 
-### Important caveat
+### Important caveat — RESOLVED in current rite
 
-`rite history` currently applies the count limit before switching to follow mode. If many new messages land between the initial read and the follow handoff, a low count can drop some of them. If we keep this design, the server should set a very high `-n` value or rite should grow a dedicated no-limit `follow from offset` mode.
+This was the plan's hard blocker (Disposition #1). It is now fixed in the source
+and the workaround it describes is obsolete:
+
+- `follow_channel_json` (`src/cli/history.rs:426`) seeds its follow cursor from
+  the bounded read's `next_offset`, not the file's EOF (`history.rs:446`), so
+  messages that land between the initial read and the follow handoff are drained,
+  not dropped.
+- `--follow-count` is a flag **distinct** from `-n` (`src/cli/mod.rs:148`).
+  The server uses `-n 0 --show-offset` only to compute the startup baseline, then
+  follows with `--after-offset <n>` and **no** `--follow-count`, so there is no
+  count cap on the live stream. The old "set a very high `-n`" advice is no
+  longer needed.
+- The directory watcher is registered *before* the backlog drain
+  (`history.rs:439-441`), closing the startup race.
+
+Still outstanding: the burst no-drop regression test from Disposition #7
+(asserting that more messages than the count, landing between baseline and follow
+handoff, are not skipped). The existing test at `history.rs:699` covers bounded
+pagination only, not follow mode.
 
 ## Message Filtering
 
-Before emitting a notification, drop:
+Forwarding is decided per message. Forward if **any** of:
 
-- messages where `message.agent == my_agent` to prevent self-loops
+- the message is on a channel in the explicit `RITE_CHANNELS` broadcast set, **or**
+- the message is a DM channel and the current agent is a participant, **or**
+- mention mode is on and `message.mentions` contains the current agent
+  (see [Mention Routing](#mention-routing)).
+
+Then, regardless of the above, always drop:
+
+- messages where `message.agent == my_agent` (self-loop prevention), and
+- anything excluded by the opt-in `RITE_ALLOWED_AGENTS` / `RITE_FORWARD_LABELS`
+  filters (Disposition #4).
+
+## Mention Routing
+
+Goal: posting `@<agent> ...` in **any** rite channel delivers that message to the
+agent's live Claude session, without the agent having to subscribe to the channel.
+
+This works because rite already parses mentions at write time: every stored
+`Message` carries `mentions: string[]`, populated by `extract_mentions`
+(`src/core/message.rs:50`). The routing key already travels in the JSON the
+follower reads — mention routing is a forwarding-rule change plus a wider watch
+set, not new parsing.
+
+### Discovery
+
+In mention mode (`RITE_MENTION_ROUTING=1`) the server watches the whole channels
+directory:
+
+1. At startup, enumerate every channel file in `channels_dir()` — project
+   channels (`<name>.jsonl`) and DM channels (`_dm_*.jsonl`).
+2. Spawn a follower per channel, each seeded from its current end offset
+   (`-n 0 --show-offset`, the baseline mechanism from Disposition #1).
+3. Watch the directory for newly-created channel files and spawn a follower for
+   each as it appears, seeded from offset 0 so a channel's very first message —
+   which may itself be the mention — is not missed.
+
+### Forwarding rule
+
+For each inbound message, forward if **any** of:
+
+- it is a DM channel and the current agent is a participant (always deliver my
+  DMs), **or**
+- `message.mentions` contains the current agent, **or**
+- the channel is in the explicit `RITE_CHANNELS` broadcast set.
+
+Always, regardless of the above: drop `message.agent == my_agent`, and apply the
+opt-in `RITE_ALLOWED_AGENTS` / `RITE_FORWARD_LABELS` filters.
+
+**Case:** match mentions case-insensitively. Agent names are canonically
+lowercase (rite convention), but `extract_mentions` preserves whatever case was
+typed (`@Rite-Dev` → `Rite-Dev`), so fold case before comparing.
+
+**DM privacy:** a mention does **not** override DM participation. If a message in
+a DM channel the agent is *not* part of happens to contain `@<agent>`, it is
+**not** forwarded — DMs are private to their two participants. Mentions only pull
+in *project*-channel messages.
+
+### reply_target
+
+Unchanged from the base design:
+
+- mention in a project channel → `reply_target` is the bare channel name; the
+  reply goes back to where the agent was mentioned.
+- DM → `reply_target` is `@<other participant>`.
+
+The notification also carries a `route` meta key (`broadcast` | `dm` | `mention`)
+so Claude knows *why* it received a message — see Notification Format.
+
+### Cost, and the scalable alternative
+
+Watch-all is one subprocess and one file watcher per channel, and every message
+in every channel is parsed and mention-checked even when discarded. This is fine
+for tens of channels. It does not scale to hundreds: process count, file
+descriptors, and wakeup volume grow with total channel count and traffic — not
+with how many messages actually mention the agent.
+
+The scalable replacement is a dedicated rite streaming primitive:
+
+```bash
+rite mentions follow --agent <name> --format json [--include-dms] [-L label]
+```
+
+It would do the cross-channel scan inside a single rite process — one watcher on
+`channels_dir()`, reading each changed file incrementally, emitting only messages
+whose `mentions` include the agent (plus the agent's DMs) as JSONL. The Bun
+server then consumes one stream instead of N subprocesses. rite already has the
+pieces: mentions are parsed at write time, and `rite wait --mention` does
+single-shot mention matching; this generalizes that to a no-cap stream with
+per-channel offset bookkeeping seeded at "now".
+
+**Plan:** ship the watch-all + filter version in the v1 plugin; swap mention mode
+to consume `rite mentions follow` once it lands in rite. Track the rite-side work
+as its own bone.
 
 ## Notification Format
 
@@ -109,7 +248,12 @@ await mcp.notification({
       from_agent: message.agent,
       channel_name: message.channel,
       reply_target: isDm ? `@${message.agent}` : message.channel,
-      msg_id: message.id,
+      // route explains WHY this message was forwarded:
+      //   'dm'        — a direct message to this agent
+      //   'mention'   — matched message.mentions in mention mode
+      //   'broadcast' — full-channel subscription via RITE_CHANNELS
+      route: isDm ? 'dm' : (mentionMatched ? 'mention' : 'broadcast'),
+      msg_id: message.id.toString(), // meta values must be strings
       ...(message.labels?.length ? { labels: message.labels.join(',') } : {}),
     },
   },
@@ -189,6 +333,10 @@ Add something like this to the channel server instructions:
 Inbound rite messages arrive as <channel source="rite-channel" ...> events.
 These are real messages from other local agents working in the same codebase.
 
+The meta.route field says why you got each message: "dm" (sent directly to you),
+"mention" (someone wrote @<you> in a channel), or "broadcast" (a channel you
+subscribe to). For "mention", reply in that channel unless asked otherwise.
+
 To reply, call the reply tool and pass meta.reply_target unchanged.
 Do not reconstruct DM targets from channel_name.
 
@@ -202,7 +350,10 @@ Messages that arrive while this session is open are pushed here automatically.
 |---|---|
 | `RITE_AGENT` | Agent name. Recommended and effectively required for predictable routing. |
 | `AGENT` | Optional compatibility fallback if `RITE_AGENT` is unset. |
-| `RITE_CHANNELS` | Comma-separated list of project channels to watch. |
+| `RITE_CHANNELS` | Comma-separated list of project channels to watch (broadcast — every message forwarded). |
+| `RITE_MENTION_ROUTING` | Opt-in. When set (`1`), watch *all* channels and forward only messages that mention the agent (plus its DMs). Makes `@<agent>` reachable from any channel. See [Mention Routing](#mention-routing). |
+| `RITE_ALLOWED_AGENTS` | Optional routing allowlist (Disposition #4). When set, only forward messages from these senders. Unset = forward all (trust the local data dir). Not authentication — local sender names are spoofable. |
+| `RITE_FORWARD_LABELS` | Optional. When set, only forward messages carrying one of these labels. |
 | `RITE_DATA_DIR` | Optional rite data directory override, passed through to subprocesses. |
 
 If neither `RITE_AGENT` nor `AGENT` is set, exit with a clear error.
@@ -241,6 +392,10 @@ This is safe only under rite's current trusted-local-machine model.
 - rite is local append-only storage, not a cryptographic identity system
 - sender identity is whatever local process wrote the message using a chosen agent name
 - if an untrusted process can write to the same rite data dir, it can inject channel events into Claude
+- mention routing widens this surface slightly: in mention mode, *any* writer to
+  *any* channel can reach the agent just by typing `@<agent>`. Under the trusted-
+  local-machine model this is fine (all writers are the same user); it is not a
+  reason to forward across a trust boundary. `RITE_ALLOWED_AGENTS` narrows it.
 
 So the correct claim is not "rite already handles authorization". The correct claim is:
 
@@ -264,6 +419,9 @@ If we want remote approval/deny flows through the same channel, Claude Code also
 - Not a replacement for `rite inbox` catch-up across sessions.
 - Not a replacement for `rite wait` in non-Claude-Code loops.
 - Not a rite server or relay; each Claude session reads local rite state directly.
+- Not a way to reach an offline agent. Mention routing only pushes to a *live*
+  session; mentions that arrive while the agent is offline wait in
+  `rite inbox --mentions` for next session.
 
 ---
 
@@ -368,3 +526,43 @@ Code smoke-test checklist (loading is gated by external org policy/login).
 This section records the decisions; the granular inline rewrites proposed as git-diffs in
 the review (notification payload code, MCP-contract section, etc.) are the follow-up edit
 once #1 lands in rite. Nothing in the review was rejected.
+
+---
+
+## Disposition (Review 2) — Mention Routing
+
+Added after a fresh check against the current source. Two findings:
+
+- **Mention data is already on the wire.** Every `Message` carries
+  `mentions: string[]`, populated at send time by `extract_mentions`
+  (`src/core/message.rs:50`), and the value is case-preserving. Cross-channel
+  mention routing needs no new parsing — only a wider watch set and a different
+  forwarding rule.
+- **The Disposition #1 streaming blocker has landed.** JSON follow seeds its
+  cursor from the bounded read's `next_offset`, not EOF (`src/cli/history.rs:446`);
+  `--follow-count` is distinct from `-n` (`src/cli/mod.rs:148`); and the watcher
+  registers before the backlog drain. The lossy follow path the plan was blocked
+  on is fixed. The burst no-drop regression test (Disposition #7) is still owed.
+
+Decisions:
+
+| # | Decision |
+|---|----------|
+| R2-1 | Add opt-in `RITE_MENTION_ROUTING` mention mode to v1: watch all channels, forward only messages mentioning the agent (plus its DMs). |
+| R2-2 | Mentions pull in *project*-channel messages only; DM privacy is preserved (a mention never overrides DM participation). |
+| R2-3 | Match mentions case-insensitively; agent names are canonically lowercase. |
+| R2-4 | Add a `route` meta key (`dm` / `mention` / `broadcast`) so Claude knows why a message was forwarded. |
+| R2-5 | Ship watch-all + filter now; add a `rite mentions follow` streaming primitive as the scalable replacement later, tracked as a separate rite bone. |
+
+This **amends Disposition #3**: v1 now supports *both* the explicit watch-list mode
+(default) and the opt-in all-channel mention mode. "Keep watch lists explicit"
+remains the default; mention mode is the opt-in for agents that want to be
+reachable as `@<agent>` from anywhere.
+
+### Open questions (Review 2)
+
+1. Should mention mode be the recommended default for interactive agents (most
+   people expect `@me` to reach them), with explicit-list mode reserved for
+   high-traffic or scoped setups? Leaning yes, but kept opt-in for v1.
+2. Build `rite mentions follow` before or after the v1 plugin ships? Current call:
+   after — the watch-all version is correct, just not maximally efficient.
