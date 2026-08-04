@@ -147,7 +147,7 @@ Exit the checkpoint loop when all children are done, or no workers are alive and
 
 2. Worker dies again (`RETRY:1` marker already exists):
    - Comment: `"Worker died again after retry. Marking done with failure."`
-   - Destroy workspace if it exists: `maw ws destroy <ws>`
+   - Destroy workspace if it exists: preview first with `maw ws destroy <ws> --dry-run` (a dead worker's workspace normally has unmerged commits, which a plain `maw ws destroy` refuses), then `maw ws destroy <ws> --force` — `--force` pins a full recovery snapshot before destroying, so the work stays recoverable via `maw ws recover <ws>`
    - Release claims: `rite claims release --agent $AGENT "bone://$EDICT_PROJECT/<child-id>"`
    - Announce: `rite send --agent $AGENT $EDICT_PROJECT "Bone <child-id> failed: worker died twice" -L task-blocked`
 

@@ -29,13 +29,12 @@ All steps below are required — they clean up resources, prevent workspace leak
 7. **Merge and destroy the workspace**: `maw ws merge $WS --into default --destroy --message "feat: <bone-title>"` (where `$WS` is the workspace name from the start step — **never `default`**; use a conventional commit prefix matching your change type: `feat:`, `fix:`, `chore:`, etc.; if the workspace is change-bound, replace `default` with that change id)
    - The `--destroy` flag is required — it cleans up the workspace after merging
    - **Never merge or destroy the default workspace.** Default is where other workspaces merge into.
-   - `maw ws merge` now produces linear history: workspace commits are rebased onto main and squashed into a single commit (as of v0.22.0)
-   - Scaffolding commits are automatically abandoned; main bookmark is automatically moved and ready for push
-   - If merge fails due to conflicts, do NOT destroy. Instead add a comment: `bn bone comment add <bone-id> "Merge conflict — workspace preserved for manual resolution"` and announce the conflict in the project channel.
+   - Merge creates a merge (or adoption) commit on the configured branch — it does not squash history — and the result is ready for `maw push`
+   - If merge fails due to conflicts, do NOT destroy. Instead add a comment: `bn bone comment add <bone-id> "Merge conflict — workspace preserved for manual resolution"` and announce the conflict in the project channel. See [Merge Conflict Recovery](#merge-conflict-recovery) below — lead with `maw ws resolve`.
    - If the command succeeds but the workspace still exists (`maw ws list`), report: `rite send --agent $AGENT $EDICT_PROJECT "Tool issue: maw ws merge --destroy did not remove workspace $WS" -L tool-issue`
 8. Release all claims held by this agent: `rite claims release --agent $AGENT --all`
 9. **If pushMain is enabled** (check `.edict.toml` for `"pushMain": true`), push to GitHub main:
-   - `maw push` (maw v0.24.0+ handles bookmark and push automatically)
+   - `maw push` (pushes the configured branch; use `maw push --advance` after direct commits to default)
    - If push fails, announce: `rite send --agent $AGENT $EDICT_PROJECT "Push failed for <bone-id>, manual intervention needed" -L tool-issue`
 10. Announce completion in the project channel: `rite send --agent $AGENT $EDICT_PROJECT "Completed <bone-id>: <bone-title>" -L task-done`
 
@@ -60,7 +59,8 @@ A "release" = user-visible changes shipped with a version tag. When in doubt, re
 
 ## Merge Conflict Recovery
 
-If `maw ws merge` detects conflicts:
+Conflicts are data, not failure — `maw ws merge` records conflicts as structured state rather
+than aborting. If `maw ws merge` reports conflicts, the workspace is preserved (not destroyed).
 
 ### Quick fix for ledger/docs conflicts only
 
@@ -74,24 +74,62 @@ Then retry `maw ws merge $WS --into default --destroy --message "feat: <bone-tit
 
 ### Full recovery when conflicts are messy
 
-If merge retries keep failing:
+Lead with `maw ws resolve` instead of hand-editing markers:
 
 ```bash
 # 1. Inspect detailed conflicts
 maw ws conflicts $WS --format json
+maw ws resolve $WS --list
 
-# 2. Undo local merge attempt and return workspace to a clean base
-maw ws undo $WS
+# 2. Pick a resolution (whole-workspace or per-file)
+maw ws resolve $WS --keep epoch          # keep the rebased-onto side
+maw ws resolve $WS --keep $WS            # keep your workspace's changes
+maw ws resolve $WS --keep <path>=<name>  # resolve one file
 
-# 3. Ensure workspace is synced to latest default
-maw ws sync $WS
+# 3. Retry merge
+maw ws merge $WS --into default --destroy --message "feat: <bone-title>"
+```
 
-# 4. Resolve and stage files in the workspace
+Or resolve inline at merge time with `maw ws merge $WS --into default --resolve-all=$WS` (or
+`--resolve <cf-id>=<name>` per conflict).
+
+Manual fallback (edit markers by hand, then stage):
+
+```bash
 maw exec $WS -- git status
 maw exec $WS -- git add <resolved-file>
+```
 
-# 5. Retry merge
-maw ws merge $WS --into default --destroy --message "feat: <bone-title>"
+If a sync/merge retry is refused because of untracked scratch files, clear them first
+(snapshot-first, always recoverable):
+
+```bash
+maw ws clean $WS --dry-run   # preview what would be removed
+maw ws clean $WS             # remove untracked files (recovery snapshot pinned first)
+```
+
+The one hard gate: merge refuses a *source* workspace whose HEAD still contains unresolved
+textual conflict markers from a prior rebase. Bypass with `--force` only when the "markers" are
+legitimate content (e.g. test fixtures).
+
+### If the merge attempt itself is stuck
+
+A killed, OOM'd, panicked, or Ctrl-C'd `maw ws merge` can leave an orphaned merge-state (distinct
+from a normal recorded conflict). Clear it with:
+
+```bash
+maw ws merge --abort
+```
+
+### To undo a COMPLETED merge
+
+If a merge already succeeded but produced the wrong result, use the repo-level undo — **not**
+`maw ws undo`, which discards the workspace's entire delta back to its base epoch (including the
+work you were trying to merge):
+
+```bash
+maw ops log    # find the op id if not the most recent
+maw undo       # undo the last completed merge (epoch+branch rewind, sources restored)
 ```
 
 ### When to escalate

@@ -166,7 +166,7 @@ Then proceed with teardown:
 - `bn bone comment add <bone-id> "Completed by $AGENT"`
 - `bn done <bone-id> --reason "Completed"`
 - `maw ws merge $WS --into default --destroy --message "feat: <bone-title>"` (use a conventional commit prefix: `feat:`, `fix:`, `chore:`, etc.; swap `default` for a change id when the workspace is change-bound; if merge conflict, preserve workspace and announce)
-- `maw push` (if pushMain enabled in `.edict.toml`; maw v0.24.0+ handles bookmark and push)
+- `maw push` (if pushMain enabled in `.edict.toml`; pushes the configured branch. Use `maw push --advance` after direct commits.)
 - `rite claims release --agent $AGENT --all`
 - `rite send --agent $AGENT $EDICT_PROJECT "Completed <bone-id>: <bone-title>" -L task-done`
 
