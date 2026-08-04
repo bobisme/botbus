@@ -46,29 +46,29 @@ max_children = 12
 checkpoint_interval_sec = 30
 
 [agents.dev.multi_lead]
-enabled = true
-max_leads = 3
-merge_timeout_sec = 120
+enabled = false
+# max_leads = 3
+# merge_timeout_sec = 120
 
-[agents.worker]
-model = "haiku"
-timeout = 600
+# [agents.worker]
+# model = "haiku"
+# timeout = 600
 
-[agents.reviewer]
-model = "opus"
-max_loops = 20
-pause = 2
-timeout = 600
+# [agents.reviewer]
+# model = "opus"
+# max_loops = 20
+# pause = 2
+# timeout = 600
 
 # Model tier pools for load balancing
 # Each tier maps to a list of "provider/model:thinking" strings
 [models]
-fast = [
-    "anthropic/claude-haiku-4-5:low",
-    "google-gemini-cli/gemini-3-flash-preview:low", "openai-codex/gpt-5.6-luna",
-]
-balanced = ["anthropic/claude-sonnet-5:medium",
-    "google-gemini-cli/gemini-3-pro-preview:medium", "openai-codex/gpt-5.6-terra",
-]
-strong = ["anthropic/claude-opus-4-8:high", "openai-codex/gpt-5.6-sol",
-]
+# fast = [
+#     "anthropic/claude-haiku-4-5:low",
+#     "google-gemini-cli/gemini-3-flash-preview:low", "openai-codex/gpt-5.6-luna",
+# ]
+# balanced = ["anthropic/claude-sonnet-5:medium",
+#     "google-gemini-cli/gemini-3-pro-preview:medium", "openai-codex/gpt-5.6-terra",
+# ]
+# strong = ["anthropic/claude-opus-4-8:high", "openai-codex/gpt-5.6-sol",
+# ]
