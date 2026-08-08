@@ -30,6 +30,16 @@ pub struct AgentState {
     /// Channels this agent is subscribed to
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscribed_channels: Vec<String>,
+
+    /// Timestamp of the agent's most recent heartbeat.
+    ///
+    /// Written on every `rite` invocation that resolves this agent's
+    /// identity (see `record_heartbeat` and `main.rs`), so it doubles as a
+    /// "last seen alive" marker. Used by `crate::core::presence` to derive
+    /// whether the agent is currently live, without the agent having to
+    /// remember to set or clear anything itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat: Option<DateTime<Utc>>,
 }
 
 impl AgentState {
@@ -286,6 +296,24 @@ impl AgentStateManager {
     pub fn get_subscribed_channels(&self) -> Result<Vec<String>> {
         Ok(self.load()?.subscribed_channels)
     }
+
+    /// Record a heartbeat for this agent at the current time.
+    ///
+    /// Returns the timestamp that was recorded, so callers can reuse it
+    /// (e.g. for logging) without a second clock read.
+    pub fn record_heartbeat(&self) -> Result<DateTime<Utc>> {
+        let now = Utc::now();
+        self.update(|s| {
+            s.last_heartbeat = Some(now);
+        })?;
+        Ok(now)
+    }
+
+    /// Get this agent's most recent heartbeat timestamp, if any has ever
+    /// been recorded.
+    pub fn get_last_heartbeat(&self) -> Result<Option<DateTime<Utc>>> {
+        Ok(self.load()?.last_heartbeat)
+    }
 }
 
 /// Read cursor information for a channel.
@@ -515,6 +543,37 @@ mod tests {
         assert_eq!(state.read_offsets.get("old-channel"), None);
         assert_eq!(state.last_read_ids.get("old-channel"), None);
         assert_eq!(state.last_read_times.get("old-channel"), None);
+    }
+
+    #[test]
+    fn test_record_and_get_heartbeat() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.json");
+        let manager = AgentStateManager::from_path(&path);
+
+        assert_eq!(manager.get_last_heartbeat().unwrap(), None);
+
+        let recorded = manager.record_heartbeat().unwrap();
+        let loaded = manager.get_last_heartbeat().unwrap();
+        assert_eq!(loaded, Some(recorded));
+    }
+
+    #[test]
+    fn test_heartbeat_overwrites_previous() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state.json");
+        let manager = AgentStateManager::from_path(&path);
+
+        let first = manager.record_heartbeat().unwrap();
+        // Force a distinguishable second timestamp regardless of clock resolution.
+        manager
+            .update(|s| {
+                s.last_heartbeat = Some(first + chrono::Duration::seconds(5));
+            })
+            .unwrap();
+
+        let loaded = manager.get_last_heartbeat().unwrap().unwrap();
+        assert!(loaded > first);
     }
 
     #[test]

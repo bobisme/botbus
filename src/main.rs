@@ -63,6 +63,16 @@ fn main() -> Result<()> {
         Commands::GenerateName | Commands::Init | Commands::Doctor | Commands::Tldr
     ) {
         ensure_data_dir()?;
+
+        // Record a presence heartbeat for whoever is running this command.
+        // This is how presence is derived (see rite::core::presence): every
+        // invocation that resolves an identity counts as a liveness signal,
+        // so agents never have to remember to set or clear anything.
+        // Best-effort — a heartbeat write failure must not block the actual
+        // command.
+        if let Some(agent) = rite::core::identity::resolve_agent(cli.agent.as_deref()) {
+            let _ = rite::core::presence::record_heartbeat(&agent);
+        }
     }
 
     match cli.command {

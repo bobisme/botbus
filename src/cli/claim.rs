@@ -10,6 +10,7 @@ use super::OutputFormat;
 use crate::core::claim::FileClaim;
 use crate::core::identity::{require_agent, resolve_agent};
 use crate::core::message::{Message, MessageMeta};
+use crate::core::presence::{self, Presence};
 use crate::core::project::{channel_path, claims_path, data_dir};
 use crate::storage::jsonl::{append_if, append_record, read_records};
 use crate::sync::auto_commit::{auto_commit_after_claim, auto_commit_after_release};
@@ -346,6 +347,13 @@ pub struct ClaimInfo {
     pub expires_in_secs: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// True when the claim's holder has a lapsed presence heartbeat (see
+    /// `crate::core::presence`) — i.e. the holder is presumed gone, not
+    /// just quiet. This is a REPORT only: rite never auto-releases another
+    /// agent's claim on the strength of this field. A claim holder with no
+    /// heartbeat history at all (predates this feature) reports `false`
+    /// here rather than a false positive.
+    pub stale: bool,
 }
 
 /// Parse a time specification (absolute or relative).
@@ -456,16 +464,26 @@ pub fn claims(
         claims_list.truncate(n);
     }
 
-    // Prepare structured output
+    // Prepare structured output. Cache presence lookups per agent - multiple
+    // claims are commonly held by the same agent, and each lookup is a
+    // small file read.
+    let mut presence_cache: std::collections::HashMap<String, Presence> =
+        std::collections::HashMap::new();
     let claim_infos: Vec<ClaimInfo> = claims_list
         .iter()
-        .map(|c| ClaimInfo {
-            agent: c.agent.clone(),
-            patterns: c.patterns.clone(),
-            active: c.active,
-            expires_at: c.expires_at,
-            expires_in_secs: (c.expires_at - now).num_seconds(),
-            message: c.message.clone(),
+        .map(|c| {
+            let presence = *presence_cache
+                .entry(c.agent.clone())
+                .or_insert_with(|| presence::agent_presence(&c.agent));
+            ClaimInfo {
+                agent: c.agent.clone(),
+                patterns: c.patterns.clone(),
+                active: c.active,
+                expires_at: c.expires_at,
+                expires_in_secs: (c.expires_at - now).num_seconds(),
+                message: c.message.clone(),
+                stale: presence.is_stale(),
+            }
         })
         .collect();
 
@@ -533,11 +551,20 @@ pub fn claims(
                 let display_patterns: Vec<String> =
                     claim.patterns.iter().map(|p| display_pattern(p)).collect();
 
+                // Presence is reported, never used to change lock behavior -
+                // a stale claim still shows its normal expiry status above.
+                let stale_marker = if presence::agent_presence(&claim.agent).is_stale() {
+                    " [STALE - holder unreachable]".red().to_string()
+                } else {
+                    String::new()
+                };
+
                 println!(
-                    "  {:<16} {:<30} {}",
+                    "  {:<16} {:<30} {}{}",
                     agent_display,
                     display_patterns.join(", ").dimmed(),
-                    status
+                    status,
+                    stale_marker
                 );
             };
 
@@ -574,6 +601,7 @@ pub fn claims(
                 let display_patterns: Vec<String> =
                     claim.patterns.iter().map(|p| display_pattern(p)).collect();
                 let remaining_mins = (claim.expires_at - now).num_minutes().max(0);
+                let stale = presence::agent_presence(&claim.agent).is_stale();
                 let reason = claim
                     .message
                     .as_ref()
@@ -581,10 +609,11 @@ pub fn claims(
                     .unwrap_or_default();
 
                 println!(
-                    "{}  {}  {}m remaining{}",
+                    "{}  {}  {}m remaining  stale:{}{}",
                     display_patterns.join(", "),
                     claim.agent,
                     remaining_mins,
+                    stale,
                     reason
                 );
             }
@@ -687,6 +716,12 @@ pub struct ClaimConflict {
     pub expires_at: DateTime<Utc>,
     /// Seconds until expiration
     pub expires_in_secs: i64,
+    /// True when the blocking agent's presence heartbeat has lapsed - a
+    /// caller can use this to tell "blocked by a live agent" (false, go
+    /// coordinate) from "blocked by a corpse" (true, holder is presumed
+    /// gone) apart. Report only: the conflict still stands either way,
+    /// nothing here releases the blocking claim.
+    pub stale: bool,
 }
 
 /// Check if a file/pattern conflicts with existing claims.
@@ -729,6 +764,7 @@ pub fn check_claim(path: String, format: OutputFormat, agent: Option<&str>) -> R
                     pattern: display_pattern(pattern), // Show relative when possible
                     expires_at: claim.expires_at,
                     expires_in_secs: (claim.expires_at - now).num_seconds(),
+                    stale: presence::agent_presence(&claim.agent).is_stale(),
                 });
             }
         }
@@ -754,11 +790,17 @@ pub fn check_claim(path: String, format: OutputFormat, agent: Option<&str>) -> R
                 println!("{} {} has conflicts:", "✗".red(), path.cyan());
                 for conflict in &output.conflicts {
                     let expires = format_duration(conflict.expires_in_secs as u64);
+                    let stale_marker = if conflict.stale {
+                        " [STALE - holder unreachable]".red().to_string()
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {} claimed {} (expires in {})",
+                        "  {} claimed {} (expires in {}){}",
                         conflict.agent.yellow(),
                         conflict.pattern.dimmed(),
-                        expires
+                        expires,
+                        stale_marker
                     );
                 }
             }
@@ -770,8 +812,8 @@ pub fn check_claim(path: String, format: OutputFormat, agent: Option<&str>) -> R
                 for conflict in &output.conflicts {
                     let expires = format_duration(conflict.expires_in_secs as u64);
                     println!(
-                        "claimed  {}  {}  \"expires in {}\"",
-                        conflict.agent, path, expires
+                        "claimed  {}  {}  \"expires in {}\"  stale:{}",
+                        conflict.agent, path, expires, conflict.stale
                     );
                 }
             }
