@@ -269,6 +269,28 @@ fn main() -> Result<()> {
             cli.agent.as_deref(),
         ),
 
+        Commands::Mentions { command } => {
+            use cli::MentionsCommands;
+            match command {
+                MentionsCommands::Follow {
+                    no_dms,
+                    labels,
+                    timeout,
+                    count,
+                } => cli::mentions::follow(
+                    cli::mentions::FollowOptions {
+                        // DMs stream by default; --no-dms opts out.
+                        include_dms: !no_dms,
+                        labels,
+                        timeout,
+                        count,
+                        format,
+                    },
+                    cli.agent.as_deref(),
+                ),
+            }
+        }
+
         Commands::Status => cli::status::run(format, cli.agent.as_deref()),
 
         Commands::Wait {

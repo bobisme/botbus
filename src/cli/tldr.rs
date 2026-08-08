@@ -34,6 +34,11 @@ pub const QUICK_REFERENCE: &str = r#"QUICK REFERENCE
       rite wait --mentions -t 300
       rite history @other-agent -f
 
+  Stream mentions and DMs (one process, all channels, JSONL)
+
+      rite mentions follow --format json
+      rite mentions follow --format json --no-dms
+
   Continue a conversation
 
       rite history rite -n 20

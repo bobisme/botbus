@@ -13,6 +13,7 @@ pub mod inbox;
 pub mod index;
 pub mod init;
 pub mod mark_read;
+pub mod mentions;
 pub mod messages;
 pub mod names;
 pub mod search;
@@ -286,6 +287,12 @@ pub enum Commands {
         format: Option<OutputFormat>,
     },
 
+    /// Stream @mentions of this agent across all channels
+    Mentions {
+        #[command(subcommand)]
+        command: MentionsCommands,
+    },
+
     /// Show status overview
     Status,
 
@@ -356,6 +363,74 @@ pub enum Commands {
     Index {
         #[command(subcommand)]
         command: IndexCommands,
+    },
+}
+
+const MENTIONS_FOLLOW_HELP: &str = "\
+Examples:
+  # Machine consumer: one JSON object per line, flushed as it is produced.
+  # Mentions from every channel, plus this agent's own DMs.
+  rite mentions follow --agent my-agent --format json
+
+  # Mentions only — suppress this agent's DMs
+  rite mentions follow --agent my-agent --format json --no-dms
+
+  # Only review traffic
+  rite mentions follow --agent my-agent --format json -L review
+
+  # Human view
+  rite mentions follow --agent my-agent --format pretty
+
+Agent workflow:
+  # One long-lived process replaces one watcher per channel. Read stdout
+  # line by line; each line is a complete record:
+  #   {\"route\":\"mention\",\"channel\":\"rite\",\"reply_target\":\"rite\",\"message\":{...}}
+  # Reply with:  rite send <reply_target> \"...\"";
+
+#[derive(Subcommand)]
+pub enum MentionsCommands {
+    /// Stream messages mentioning this agent, plus its DMs, across all channels
+    ///
+    /// Emits one record per matching message and runs until killed. With
+    /// `--format json` the stream is JSONL: exactly one JSON object per line,
+    /// flushed as it is produced. There is no closing envelope because the
+    /// stream has no end — each line is the envelope. `--format text` emits one
+    /// two-space-delimited line per record (id, route, channel, agent, body);
+    /// `--format pretty` is the human view.
+    ///
+    /// Every record carries a `route` discriminator saying why it was
+    /// forwarded: "mention" (the message's mentions include this agent) or "dm"
+    /// (a direct message this agent is a party to). It also carries
+    /// `reply_target`, the argument to pass to `rite send`.
+    ///
+    /// This agent's own DMs are always delivered — a DM is the most direct form
+    /// of address there is. Pass --no-dms for a mentions-only stream.
+    ///
+    /// Channels that already exist are seeded at their current end of file, so
+    /// startup does not replay history. Channels created after startup are read
+    /// from the beginning, so a channel whose first message is the mention is
+    /// not missed.
+    ///
+    /// Mention matching is case-insensitive. DM privacy is absolute: a mention
+    /// never routes a message out of a DM this agent is not a party to. This
+    /// agent's own messages are never echoed back.
+    #[command(after_help = MENTIONS_FOLLOW_HELP)]
+    Follow {
+        /// Suppress this agent's own DMs (default: DMs are streamed)
+        #[arg(long)]
+        no_dms: bool,
+
+        /// Only stream messages with this label (repeatable; matches any)
+        #[arg(short = 'L', long = "label", action = clap::ArgAction::Append)]
+        labels: Vec<String>,
+
+        /// Stop after N seconds (default: run until killed)
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Stop after N records (default: uncapped)
+        #[arg(short = 'n', long)]
+        count: Option<usize>,
     },
 }
 

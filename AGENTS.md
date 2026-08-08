@@ -46,6 +46,7 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 | `search` | `rite search <query> [-c channel] [-n count] [--from]` |
 | `wait` | `rite wait [-c channel] [--mention] [-L label] [-t timeout]` |
 | `watch` | `rite watch [channel]` — stream messages in real-time |
+| `mentions follow` | `rite mentions follow --format json [--no-dms] [-L label]` — JSONL stream of every message mentioning you, across all channels, plus your DMs |
 | `status` | `rite status` — overview of agents, channels, claims |
 
 ### Claims (advisory locks)
