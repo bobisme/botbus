@@ -10,10 +10,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use super::OutputFormat;
+use crate::core::claim::FileClaim;
 use crate::core::identity::resolve_agent;
+use crate::core::message::Message;
 use crate::core::names::is_valid_name;
-use crate::core::project::{channels_dir, claims_path, data_dir, index_path, state_path};
+use crate::core::project::{
+    channels_dir, claims_path, data_dir, hooks_path, index_path, state_path, statuses_path,
+};
+use crate::core::status::AgentStatusEntry;
+use crate::storage::jsonl::{SkippedLine, scan_skipped};
 use crate::sync::git;
+
+/// How many skipped-line details to show before truncating.
+const MAX_SKIPPED_DETAILS: usize = 5;
 
 /// A single check result.
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +42,27 @@ pub enum CheckStatus {
     Fail,
 }
 
+/// A JSONL line that the current build cannot read, as reported by doctor.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedRecord {
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    pub byte_offset: u64,
+    pub error: String,
+}
+
+impl From<&SkippedLine> for SkippedRecord {
+    fn from(skip: &SkippedLine) -> Self {
+        Self {
+            file: skip.path.display().to_string(),
+            line: skip.line,
+            byte_offset: skip.byte_offset,
+            error: skip.error.clone(),
+        }
+    }
+}
+
 /// Full doctor report.
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
@@ -42,6 +72,12 @@ pub struct DoctorReport {
     pub fail_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advice: Vec<String>,
+    /// Total number of JSONL lines this build had to skip while reading the
+    /// data directory. Recomputed on every run — never persisted.
+    pub skipped_line_count: usize,
+    /// Details of the skipped lines (all of them, for machine consumers).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped_records: Vec<SkippedRecord>,
 }
 
 impl DoctorReport {
@@ -52,6 +88,8 @@ impl DoctorReport {
             warn_count: 0,
             fail_count: 0,
             advice: Vec::new(),
+            skipped_line_count: 0,
+            skipped_records: Vec::new(),
         }
     }
 
@@ -96,6 +134,9 @@ pub fn run(format: OutputFormat) -> Result<()> {
 
     // Check 8: Git availability (for sync features)
     check_git_available(&mut report);
+
+    // Check 9: JSONL records this build cannot read (mixed-version sync)
+    check_record_readability(&mut report);
 
     // Build advice based on failed/warned checks
     for check in &report.checks {
@@ -336,6 +377,125 @@ fn is_writable(path: &Path) -> bool {
     }
 }
 
+/// Report JSONL lines that this build has to skip when reading.
+///
+/// Readers skip unreadable lines so one bad record cannot deny access to a
+/// whole file; this check makes that skipping visible. Note that a record
+/// carrying an unrecognized *type* is not skipped at all — it is kept verbatim
+/// (see [`crate::core::wire`]) and never appears here. Everything counted here
+/// is a line this build genuinely could not read. The counts are
+/// recomputed from disk on every run rather than persisted: whether a line is
+/// readable is a property of *this binary's* schema, not of the file, so a
+/// stored count would go stale the moment either side is upgraded, and writing
+/// to the data directory during a read-only health check would churn git sync.
+fn check_record_readability(report: &mut DoctorReport) {
+    let mut skipped: Vec<SkippedLine> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut scan_errors: Vec<String> = Vec::new();
+
+    let mut scan = |result: Result<Vec<SkippedLine>>,
+                    skipped: &mut Vec<SkippedLine>,
+                    files_scanned: &mut usize| match result {
+        Ok(lines) => {
+            *files_scanned += 1;
+            skipped.extend(lines);
+        }
+        Err(e) => scan_errors.push(e.to_string()),
+    };
+
+    // Channel files hold messages.
+    if let Ok(entries) = fs::read_dir(channels_dir()) {
+        let mut channel_files: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        channel_files.sort();
+
+        for path in channel_files {
+            scan(
+                scan_skipped::<Message>(&path),
+                &mut skipped,
+                &mut files_scanned,
+            );
+        }
+    }
+
+    // Top-level record files.
+    scan(
+        scan_skipped::<FileClaim>(&claims_path()),
+        &mut skipped,
+        &mut files_scanned,
+    );
+    scan(
+        scan_skipped::<AgentStatusEntry>(&statuses_path()),
+        &mut skipped,
+        &mut files_scanned,
+    );
+    scan(
+        scan_skipped::<crate::core::hook::Hook>(&hooks_path()),
+        &mut skipped,
+        &mut files_scanned,
+    );
+
+    report.skipped_line_count = skipped.len();
+    report.skipped_records = skipped.iter().map(SkippedRecord::from).collect();
+
+    if !scan_errors.is_empty() {
+        report.add(Check {
+            name: "record_readability".to_string(),
+            status: CheckStatus::Warn,
+            message: format!("Could not scan some data files: {}", scan_errors.join("; ")),
+            suggestion: Some(format!("Check permissions on {}", data_dir().display())),
+        });
+        return;
+    }
+
+    if skipped.is_empty() {
+        report.add(Check {
+            name: "record_readability".to_string(),
+            status: CheckStatus::Pass,
+            message: format!("All records readable across {} file(s)", files_scanned),
+            suggestion: None,
+        });
+        return;
+    }
+
+    let mut files: Vec<&Path> = skipped.iter().map(|s| s.path.as_path()).collect();
+    files.sort_unstable();
+    files.dedup();
+
+    let detail = skipped
+        .iter()
+        .take(MAX_SKIPPED_DETAILS)
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    report.add(Check {
+        name: "record_readability".to_string(),
+        status: CheckStatus::Warn,
+        message: format!(
+            "Skipped {} unreadable line(s) across {} file(s): {}{}",
+            skipped.len(),
+            files.len(),
+            detail,
+            if skipped.len() > MAX_SKIPPED_DETAILS {
+                format!(" (+{} more)", skipped.len() - MAX_SKIPPED_DETAILS)
+            } else {
+                String::new()
+            }
+        ),
+        suggestion: Some(
+            "These lines are damaged, or were written by a rite that changed a record type this \
+             build already knows — records whose type is merely unrecognized are read fine and \
+             are not counted here. Inspect the reported file and line; upgrade this install \
+             (cargo install rite) if the writer is newer."
+                .to_string(),
+        ),
+    });
+}
+
 fn check_git_available(report: &mut DoctorReport) {
     if git::check_git_available() {
         report.add(Check {
@@ -437,6 +597,68 @@ mod tests {
         unsafe {
             env::remove_var(DATA_DIR_ENV_VAR);
             env::remove_var("RITE_AGENT");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_doctor_reports_skipped_lines() {
+        use std::io::Write;
+
+        let temp = TempDir::new().unwrap();
+        unsafe {
+            env::set_var(DATA_DIR_ENV_VAR, temp.path().to_str().unwrap());
+        }
+
+        let channels = temp.path().join("channels");
+        fs::create_dir_all(&channels).unwrap();
+        let channel = channels.join("general.jsonl");
+
+        let good = crate::core::message::Message::new("agent", "general", "hello");
+        crate::storage::jsonl::append_record(&channel, &good).unwrap();
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&channel).unwrap();
+            // Line 2: a variant from a newer rite. Readable, must NOT be counted.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"newer","channel":"general","body":"future","meta":{{"type":"reaction","emoji":"+1"}}}}"#
+            )
+            .unwrap();
+            // Line 3: known meta type with a damaged body. Corruption, must be counted.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FBW","agent":"damaged","channel":"general","body":"corrupt","meta":{{"type":"claim"}}}}"#
+            )
+            .unwrap();
+            // Line 4: missing the required `id`/`ts` fields entirely.
+            writeln!(file, r#"{{"kind":"something-new","body":"x"}}"#).unwrap();
+        }
+
+        let mut report = DoctorReport::new();
+        check_record_readability(&mut report);
+
+        assert_eq!(
+            report.skipped_line_count, 2,
+            "the future record must not be counted, the two damaged ones must be"
+        );
+        assert_eq!(report.warn_count, 1);
+        assert_eq!(report.skipped_records.len(), 2);
+        assert_eq!(report.skipped_records[0].line, Some(3));
+        assert!(report.skipped_records[0].error.contains("corrupt"));
+        assert_eq!(report.skipped_records[1].line, Some(4));
+        assert!(report.skipped_records[0].file.ends_with("general.jsonl"));
+        assert!(report.checks[0].message.contains("Skipped 2 unreadable"));
+
+        // A clean data directory passes and reports a zero count.
+        fs::remove_file(&channel).unwrap();
+        crate::storage::jsonl::append_record(&channel, &good).unwrap();
+        let mut clean = DoctorReport::new();
+        check_record_readability(&mut clean);
+        assert_eq!(clean.skipped_line_count, 0);
+        assert_eq!(clean.pass_count, 1);
+
+        unsafe {
+            env::remove_var(DATA_DIR_ENV_VAR);
         }
     }
 

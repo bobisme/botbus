@@ -677,6 +677,10 @@ fn format_outbound_message(msg: &Message) -> String {
             AttachmentContent::File { .. } => {
                 // File attachments are sent separately as media messages
             }
+            AttachmentContent::Unknown(_) => {
+                // Written by a newer rite; note its presence without guessing.
+                text.push_str(&format!("\n[unsupported attachment: {}]", attachment.name));
+            }
         }
     }
 
@@ -760,6 +764,9 @@ async fn send_attachment_to_telegram(
         }
         AttachmentContent::Url { .. } => {
             // URLs are embedded in the text message body
+        }
+        AttachmentContent::Unknown(_) => {
+            // Unrecognized attachment type; already noted in the text body.
         }
     }
 

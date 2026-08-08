@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use ulid::Ulid;
 
+use crate::core::wire::{self, ForwardCompatible};
+
 /// The fundamental unit of communication in Rite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -103,8 +105,13 @@ pub struct Attachment {
 }
 
 /// Content of an attachment - either a file reference or inline content.
+///
+/// Carries an [`AttachmentContent::Unknown`] fallback so an attachment type
+/// added by a newer rite does not make the whole message unreadable. A
+/// *recognized* type with a broken body is still a hard error — see
+/// [`crate::core::wire`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", remote = "Self")]
 pub enum AttachmentContent {
     /// Reference to a file path (relative to project root)
     File { path: String },
@@ -119,6 +126,45 @@ pub enum AttachmentContent {
 
     /// URL reference
     Url { url: String },
+
+    /// An attachment type this build does not recognize.
+    ///
+    /// The raw JSON is kept verbatim so re-serializing does not lose data.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+impl ForwardCompatible for AttachmentContent {
+    const WIRE_NAME: &'static str = "attachment";
+    const KNOWN_TAGS: &'static [&'static str] = &["file", "inline", "url"];
+
+    fn tag(value: &serde_json::Value) -> Option<&str> {
+        wire::internal_tag(value, "type")
+    }
+
+    fn parse_known(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        AttachmentContent::deserialize(value)
+    }
+
+    fn unknown(value: serde_json::Value) -> Self {
+        AttachmentContent::Unknown(value)
+    }
+
+    fn is_unknown(&self) -> bool {
+        matches!(self, AttachmentContent::Unknown(_))
+    }
+}
+
+impl Serialize for AttachmentContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AttachmentContent::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AttachmentContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::deserialize(deserializer)
+    }
 }
 
 impl Attachment {
@@ -163,13 +209,28 @@ impl Attachment {
             AttachmentContent::File { path } => std::path::Path::new(path).exists(),
             AttachmentContent::Inline { .. } => true,
             AttachmentContent::Url { .. } => true,
+            // Nothing local to fetch, and nothing this build can render.
+            AttachmentContent::Unknown(_) => false,
         }
     }
 }
 
 /// Structured metadata for special message types.
+///
+/// # Forward compatibility
+///
+/// Rite instances sync channel files over git, so an older build routinely
+/// reads records written by a newer one. Every tagged enum on the wire
+/// therefore carries an `Unknown` fallback: an unrecognized `type` deserializes
+/// into [`MessageMeta::Unknown`] holding the raw JSON, instead of failing the
+/// parse (and, before this, the entire file read). Ignore what you do not
+/// understand; never drop it.
+///
+/// This leniency stops at the tag. A `type` this build *does* know, carrying a
+/// body it cannot read, is corruption and still fails the parse loudly — see
+/// [`crate::core::wire`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", remote = "Self")]
 pub enum MessageMeta {
     /// Agent claimed files for editing
     Claim {
@@ -195,10 +256,56 @@ pub enum MessageMeta {
         deleted_by: String,
         deleted_at: DateTime<Utc>,
     },
+
+    /// Metadata written by a newer rite that this build does not understand.
+    ///
+    /// Holds the raw JSON verbatim, so the record survives a round-trip and
+    /// stays inspectable (`rite messages get --format json`).
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
+impl ForwardCompatible for MessageMeta {
+    const WIRE_NAME: &'static str = "message meta";
+    const KNOWN_TAGS: &'static [&'static str] =
+        &["claim", "claim_extended", "release", "system", "deleted"];
+
+    fn tag(value: &serde_json::Value) -> Option<&str> {
+        wire::internal_tag(value, "type")
+    }
+
+    fn parse_known(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        MessageMeta::deserialize(value)
+    }
+
+    fn unknown(value: serde_json::Value) -> Self {
+        MessageMeta::Unknown(value)
+    }
+
+    fn is_unknown(&self) -> bool {
+        matches!(self, MessageMeta::Unknown(_))
+    }
+}
+
+impl Serialize for MessageMeta {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        MessageMeta::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageMeta {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::deserialize(deserializer)
+    }
+}
+
+/// System events carried by [`MessageMeta::System`].
+///
+/// Same forward-compatibility contract as [`MessageMeta`]: an unrecognized
+/// event kind becomes [`SystemEvent::Unknown`]; a recognized one with a broken
+/// body is corruption and fails the parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", remote = "Self")]
 pub enum SystemEvent {
     AgentRegistered,
     AgentRenamed {
@@ -211,6 +318,47 @@ pub enum SystemEvent {
         hook_id: String,
         command: Vec<String>,
     },
+    /// A system event this build does not recognize, kept verbatim.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
+}
+
+impl ForwardCompatible for SystemEvent {
+    const WIRE_NAME: &'static str = "system event";
+    const KNOWN_TAGS: &'static [&'static str] = &[
+        "agent_registered",
+        "agent_renamed",
+        "claim_expired",
+        "hook_fired",
+    ];
+
+    fn tag(value: &serde_json::Value) -> Option<&str> {
+        wire::external_tag(value)
+    }
+
+    fn parse_known(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        SystemEvent::deserialize(value)
+    }
+
+    fn unknown(value: serde_json::Value) -> Self {
+        SystemEvent::Unknown(value)
+    }
+
+    fn is_unknown(&self) -> bool {
+        matches!(self, SystemEvent::Unknown(_))
+    }
+}
+
+impl Serialize for SystemEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SystemEvent::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        wire::deserialize(deserializer)
+    }
 }
 
 impl Message {
@@ -310,10 +458,16 @@ pub fn offset_after_message_id(path: &Path, id: &str) -> anyhow::Result<Option<u
             continue;
         }
 
-        let msg: Message = serde_json::from_str(line.trim())
-            .with_context(|| format!("Failed to parse in {}: {}", path.display(), line))?;
-        if msg.id.to_string() == id {
-            return Ok(Some(pos));
+        // An unreadable line must not abort the scan; skip it and keep looking.
+        match serde_json::from_str::<Message>(line.trim()) {
+            Ok(msg) if msg.id.to_string() == id => return Ok(Some(pos)),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                byte_offset = pos,
+                error = %error,
+                "skipping unreadable JSONL record while seeking message id"
+            ),
         }
     }
 
@@ -503,6 +657,353 @@ mod tests {
         // Empty vecs should not appear in JSON output
         assert!(!json.contains("\"labels\""));
         assert!(!json.contains("\"attachments\""));
+    }
+
+    /// A record written by a future rite must deserialize into `Unknown`
+    /// rather than failing the parse, and must survive a round-trip verbatim.
+    #[test]
+    fn test_unknown_message_meta_round_trips() {
+        let future = r#"{"type":"reaction","emoji":"+1","target_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#;
+
+        let meta: MessageMeta =
+            serde_json::from_str(future).expect("unknown meta type must not be a parse error");
+        assert!(matches!(meta, MessageMeta::Unknown(_)));
+
+        // Re-serializing preserves the original payload exactly.
+        let round_tripped = serde_json::to_value(&meta).unwrap();
+        let original: serde_json::Value = serde_json::from_str(future).unwrap();
+        assert_eq!(round_tripped, original);
+    }
+
+    /// The tolerance stops at the tag: a `type` this build knows, carrying a
+    /// body it cannot read, is corruption and must NOT become `Unknown`.
+    #[test]
+    fn test_corrupt_known_meta_is_an_error() {
+        // `claim` is a known tag, but `patterns`/`ttl_secs` are missing.
+        let error = serde_json::from_str::<MessageMeta>(r#"{"type":"claim"}"#)
+            .expect_err("a damaged known variant must not deserialize");
+        assert!(error.to_string().contains("corrupt"), "{}", error);
+        assert!(error.to_string().contains("claim"), "{}", error);
+
+        // Wrong field types count too.
+        assert!(
+            serde_json::from_str::<MessageMeta>(
+                r#"{"type":"claim","patterns":"not-a-list","ttl_secs":1}"#
+            )
+            .is_err()
+        );
+
+        // A nested system event with a damaged body fails the outer record.
+        assert!(
+            serde_json::from_str::<MessageMeta>(
+                r#"{"type":"system","event":{"agent_renamed":{}}}"#
+            )
+            .is_err()
+        );
+
+        // And a record with no tag at all is not a shape rite ever writes.
+        let error = serde_json::from_str::<MessageMeta>(r#"{"patterns":["a"]}"#)
+            .expect_err("a record without a tag must not deserialize");
+        assert!(error.to_string().contains("no variant tag"), "{}", error);
+    }
+
+    #[test]
+    fn test_corrupt_known_system_event_is_an_error() {
+        // Known tag, missing `old_name`.
+        assert!(serde_json::from_str::<SystemEvent>(r#"{"agent_renamed":{}}"#).is_err());
+        // Unknown tag with the same shape stays benign.
+        assert!(matches!(
+            serde_json::from_str::<SystemEvent>(r#"{"agent_paused":{}}"#).unwrap(),
+            SystemEvent::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn test_corrupt_known_attachment_is_an_error() {
+        // `file` is known but `path` is missing.
+        assert!(serde_json::from_str::<Attachment>(r#"{"name":"a","type":"file"}"#).is_err());
+        // An unknown type with the same missing field is still benign.
+        assert!(matches!(
+            serde_json::from_str::<Attachment>(r#"{"name":"a","type":"video"}"#)
+                .unwrap()
+                .content,
+            AttachmentContent::Unknown(_)
+        ));
+    }
+
+    /// Guard against `KNOWN_TAGS` drifting away from the variants. The match is
+    /// exhaustive, so adding a variant fails to compile until it is listed.
+    #[test]
+    fn test_message_meta_known_tags_match_variants() {
+        fn tag_of(meta: &MessageMeta) -> Option<&'static str> {
+            match meta {
+                MessageMeta::Claim { .. } => Some("claim"),
+                MessageMeta::ClaimExtended { .. } => Some("claim_extended"),
+                MessageMeta::Release { .. } => Some("release"),
+                MessageMeta::System { .. } => Some("system"),
+                MessageMeta::Deleted { .. } => Some("deleted"),
+                MessageMeta::Unknown(_) => None,
+            }
+        }
+
+        let samples = vec![
+            MessageMeta::Claim {
+                patterns: vec!["a".to_string()],
+                ttl_secs: 1,
+            },
+            MessageMeta::ClaimExtended {
+                patterns: vec!["a".to_string()],
+                ttl_secs: 1,
+            },
+            MessageMeta::Release {
+                patterns: vec!["a".to_string()],
+            },
+            MessageMeta::System {
+                event: SystemEvent::AgentRegistered,
+            },
+            MessageMeta::Deleted {
+                target_id: Ulid::nil(),
+                deleted_by: "a".to_string(),
+                deleted_at: Utc::now(),
+            },
+        ];
+        assert_eq!(
+            samples.len(),
+            MessageMeta::KNOWN_TAGS.len(),
+            "every known tag needs a sample here"
+        );
+
+        for sample in &samples {
+            let tag = tag_of(sample).expect("samples are known variants");
+            assert!(
+                MessageMeta::KNOWN_TAGS.contains(&tag),
+                "missing tag: {}",
+                tag
+            );
+
+            let value = serde_json::to_value(sample).unwrap();
+            assert_eq!(
+                MessageMeta::tag(&value),
+                Some(tag),
+                "wire tag does not match KNOWN_TAGS entry"
+            );
+            let parsed: MessageMeta = serde_json::from_value(value).unwrap();
+            assert!(!parsed.is_unknown(), "{} fell into the fallback", tag);
+        }
+    }
+
+    #[test]
+    fn test_system_event_known_tags_match_variants() {
+        fn tag_of(event: &SystemEvent) -> Option<&'static str> {
+            match event {
+                SystemEvent::AgentRegistered => Some("agent_registered"),
+                SystemEvent::AgentRenamed { .. } => Some("agent_renamed"),
+                SystemEvent::ClaimExpired { .. } => Some("claim_expired"),
+                SystemEvent::HookFired { .. } => Some("hook_fired"),
+                SystemEvent::Unknown(_) => None,
+            }
+        }
+
+        let samples = vec![
+            SystemEvent::AgentRegistered,
+            SystemEvent::AgentRenamed {
+                old_name: "a".to_string(),
+            },
+            SystemEvent::ClaimExpired {
+                patterns: vec!["a".to_string()],
+            },
+            SystemEvent::HookFired {
+                hook_id: "hk-1".to_string(),
+                command: vec!["echo".to_string()],
+            },
+        ];
+        assert_eq!(samples.len(), SystemEvent::KNOWN_TAGS.len());
+
+        for sample in &samples {
+            let tag = tag_of(sample).expect("samples are known variants");
+            assert!(
+                SystemEvent::KNOWN_TAGS.contains(&tag),
+                "missing tag: {}",
+                tag
+            );
+
+            let value = serde_json::to_value(sample).unwrap();
+            assert_eq!(SystemEvent::tag(&value), Some(tag));
+            let parsed: SystemEvent = serde_json::from_value(value).unwrap();
+            assert!(!parsed.is_unknown(), "{} fell into the fallback", tag);
+        }
+    }
+
+    #[test]
+    fn test_attachment_content_known_tags_match_variants() {
+        fn tag_of(content: &AttachmentContent) -> Option<&'static str> {
+            match content {
+                AttachmentContent::File { .. } => Some("file"),
+                AttachmentContent::Inline { .. } => Some("inline"),
+                AttachmentContent::Url { .. } => Some("url"),
+                AttachmentContent::Unknown(_) => None,
+            }
+        }
+
+        let samples = vec![
+            AttachmentContent::File {
+                path: "a".to_string(),
+            },
+            AttachmentContent::Inline {
+                content: "a".to_string(),
+                language: None,
+            },
+            AttachmentContent::Url {
+                url: "https://example.com".to_string(),
+            },
+        ];
+        assert_eq!(samples.len(), AttachmentContent::KNOWN_TAGS.len());
+
+        for sample in &samples {
+            let tag = tag_of(sample).expect("samples are known variants");
+            assert!(
+                AttachmentContent::KNOWN_TAGS.contains(&tag),
+                "missing tag: {}",
+                tag
+            );
+
+            let value = serde_json::to_value(sample).unwrap();
+            assert_eq!(AttachmentContent::tag(&value), Some(tag));
+            let parsed: AttachmentContent = serde_json::from_value(value).unwrap();
+            assert!(!parsed.is_unknown(), "{} fell into the fallback", tag);
+        }
+    }
+
+    /// The fallback must not shadow variants this build does know.
+    #[test]
+    fn test_known_message_meta_still_wins() {
+        let meta = MessageMeta::Claim {
+            patterns: vec!["src/**".to_string()],
+            ttl_secs: 3600,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"claim","patterns":["src/**"],"ttl_secs":3600}"#
+        );
+
+        let parsed: MessageMeta = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, MessageMeta::Claim { .. }));
+
+        let tombstone = MessageMeta::Deleted {
+            target_id: Ulid::nil(),
+            deleted_by: "agent".to_string(),
+            deleted_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&tombstone).unwrap();
+        let parsed: MessageMeta = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, MessageMeta::Deleted { .. }));
+    }
+
+    #[test]
+    fn test_unknown_system_event_round_trips() {
+        let future = r#"{"agent_evicted":{"reason":"idle"}}"#;
+        let event: SystemEvent = serde_json::from_str(future).unwrap();
+        assert!(matches!(event, SystemEvent::Unknown(_)));
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::from_str::<serde_json::Value>(future).unwrap()
+        );
+
+        // Known events keep their existing encoding.
+        let known: SystemEvent = serde_json::from_str(r#""agent_registered""#).unwrap();
+        assert!(matches!(known, SystemEvent::AgentRegistered));
+    }
+
+    #[test]
+    fn test_unknown_attachment_type_round_trips() {
+        let future = r#"{"name":"clip","type":"video","stream_id":"abc"}"#;
+        let attachment: Attachment = serde_json::from_str(future).unwrap();
+        assert_eq!(attachment.name, "clip");
+        assert!(matches!(attachment.content, AttachmentContent::Unknown(_)));
+        assert!(!attachment.is_available());
+    }
+
+    /// The whole point of the fallback: one future record in a channel file
+    /// must not deny access to the messages around it.
+    #[test]
+    fn test_future_message_in_channel_still_readable() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("channel.jsonl");
+
+        let before = Message::new("agent", "channel", "before");
+        let after = Message::new("agent", "channel", "after");
+        crate::storage::jsonl::append_record(&path, &before).unwrap();
+
+        // A message a newer rite could write: unknown meta type + unknown field.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"future","channel":"channel","body":"from the future","meta":{{"type":"reaction","emoji":"+1"}},"priority":"high"}}"#
+            )
+            .unwrap();
+        }
+
+        crate::storage::jsonl::append_record(&path, &after).unwrap();
+
+        let messages = read_messages(&path).unwrap();
+        assert_eq!(messages.len(), 3, "future record must not be dropped");
+        assert_eq!(messages[0].body, "before");
+        assert_eq!(messages[1].body, "from the future");
+        assert!(matches!(messages[1].meta, Some(MessageMeta::Unknown(_))));
+        assert_eq!(messages[2].body, "after");
+    }
+
+    /// The two cases must not share a fate: a future record is kept and not
+    /// counted; a corrupt record is skipped, counted, and reported.
+    #[test]
+    fn test_future_record_is_kept_but_corrupt_record_is_counted() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("channel.jsonl");
+
+        crate::storage::jsonl::append_record(&path, &Message::new("agent", "channel", "good"))
+            .unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            // Line 2: unknown meta type — a newer rite's variant. Benign.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"newer","channel":"channel","body":"future","meta":{{"type":"reaction","emoji":"+1"}}}}"#
+            )
+            .unwrap();
+            // Line 3: known meta type with a damaged body. Corruption.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FBW","agent":"damaged","channel":"channel","body":"corrupt","meta":{{"type":"claim"}}}}"#
+            )
+            .unwrap();
+        }
+
+        let (messages, skipped) =
+            crate::storage::jsonl::read_records_reporting::<Message>(&path).unwrap();
+
+        assert_eq!(messages.len(), 2, "the future record must survive");
+        assert_eq!(messages[1].body, "future");
+        assert!(matches!(messages[1].meta, Some(MessageMeta::Unknown(_))));
+
+        assert_eq!(skipped.len(), 1, "only the corrupt record is skipped");
+        assert_eq!(skipped[0].line, Some(3));
+        assert!(skipped[0].error.contains("corrupt"), "{}", skipped[0].error);
+        assert!(skipped[0].error.contains("claim"), "{}", skipped[0].error);
     }
 
     #[test]

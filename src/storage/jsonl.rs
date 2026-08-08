@@ -1,9 +1,133 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Serialize, de::DeserializeOwned};
+use std::collections::HashSet;
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+/// A JSONL line that could not be deserialized and was therefore skipped.
+///
+/// Records are skipped rather than fatal so that a single unreadable line — a
+/// record written by a newer rite, or a truncated write — cannot deny access to
+/// every other record in the file. Skips are never silent: readers warn (see
+/// [`report_skipped`]) and `rite doctor` re-scans and reports the totals.
+#[derive(Debug, Clone)]
+pub struct SkippedLine {
+    /// File the line came from.
+    pub path: PathBuf,
+    /// 1-based line number, when the read started at the top of the file.
+    /// `None` for reads that begin at a mid-file byte offset.
+    pub line: Option<u64>,
+    /// Byte offset of the first byte of the skipped line.
+    pub byte_offset: u64,
+    /// Why the line could not be parsed.
+    pub error: String,
+}
+
+impl fmt::Display for SkippedLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.line {
+            Some(line) => write!(f, "{}:{}: {}", self.path.display(), line, self.error),
+            None => write!(
+                f,
+                "{}@byte {}: {}",
+                self.path.display(),
+                self.byte_offset,
+                self.error
+            ),
+        }
+    }
+}
+
+/// Files already warned about in this process, so a repeated read (a TUI
+/// refresh loop, say) does not spam stderr with the same diagnostic.
+fn warned_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    static WARNED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Make skipped lines observable.
+///
+/// Every skip is emitted as a `tracing` warning (structured, picked up by
+/// telemetry when configured). Additionally, the first skip per file per
+/// process prints a human-visible note to stderr, because tracing is a no-op
+/// unless telemetry is enabled and silent data loss is worse than noise.
+fn report_skipped(skipped: &[SkippedLine]) {
+    if skipped.is_empty() {
+        return;
+    }
+
+    for skip in skipped {
+        tracing::warn!(
+            path = %skip.path.display(),
+            line = skip.line,
+            byte_offset = skip.byte_offset,
+            error = %skip.error,
+            "skipping unreadable JSONL record"
+        );
+    }
+
+    let path = skipped[0].path.clone();
+    let first_time = warned_paths()
+        .lock()
+        .map(|mut seen| seen.insert(path.clone()))
+        .unwrap_or(false);
+
+    if first_time {
+        eprintln!(
+            "warning: skipped {} unreadable line(s) in {} (first: {}); run `rite doctor` for details",
+            skipped.len(),
+            path.display(),
+            skipped[0]
+        );
+    }
+}
+
+/// Try to deserialize one raw JSONL line.
+///
+/// Returns `Ok(None)` for blank lines. A line that cannot be parsed is recorded
+/// in `skipped` (with file/line/offset context) and yields `Ok(None)` too, so
+/// callers continue with the rest of the file.
+fn parse_line<T: DeserializeOwned>(
+    raw: &[u8],
+    path: &Path,
+    line: Option<u64>,
+    byte_offset: u64,
+    skipped: &mut Vec<SkippedLine>,
+) -> Option<T> {
+    let text = match std::str::from_utf8(raw) {
+        Ok(text) => text,
+        Err(error) => {
+            skipped.push(SkippedLine {
+                path: path.to_path_buf(),
+                line,
+                byte_offset,
+                error: format!("invalid UTF-8: {}", error),
+            });
+            return None;
+        }
+    };
+
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    match serde_json::from_str(text) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            skipped.push(SkippedLine {
+                path: path.to_path_buf(),
+                line,
+                byte_offset,
+                error: error.to_string(),
+            });
+            None
+        }
+    }
+}
 
 /// Append a single record to a JSONL file with exclusive locking.
 ///
@@ -93,23 +217,35 @@ where
     file.lock_exclusive()
         .with_context(|| format!("Failed to acquire lock on: {}", path.display()))?;
 
-    // Read existing records while holding the lock
-    let reader = BufReader::new(&file);
+    // Read existing records while holding the lock. Unreadable lines are
+    // skipped (and reported) rather than aborting the check-and-append.
+    let mut reader = BufReader::new(&file);
     let mut records: Vec<T> = Vec::new();
+    let mut skipped = Vec::new();
 
-    for line_result in reader.lines() {
-        let line =
-            line_result.with_context(|| format!("Failed to read from: {}", path.display()))?;
+    let mut raw = Vec::new();
+    let mut byte_offset = 0u64;
+    let mut line_no = 0u64;
 
-        if line.trim().is_empty() {
-            continue;
+    loop {
+        raw.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw)
+            .with_context(|| format!("Failed to read from: {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
         }
 
-        let rec: T = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse in {}: {}", path.display(), line))?;
+        let line_start = byte_offset;
+        byte_offset += bytes_read as u64;
+        line_no += 1;
 
-        records.push(rec);
+        if let Some(rec) = parse_line(&raw, path, Some(line_no), line_start, &mut skipped) {
+            records.push(rec);
+        }
     }
+
+    report_skipped(&skipped);
 
     // Check if we should append
     if !predicate(&records) {
@@ -133,9 +269,46 @@ where
 /// Read all records from a JSONL file.
 ///
 /// Returns an empty Vec if the file doesn't exist.
+///
+/// Lines that cannot be deserialized (records from a newer rite, truncated
+/// writes, non-UTF-8 bytes) are skipped and reported rather than failing the
+/// whole read — one bad line must not deny access to the rest of the file.
 pub fn read_records<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let (records, skipped) = read_records_reporting(path)?;
+    report_skipped(&skipped);
+    Ok(records)
+}
+
+/// Like [`read_records`], but returns the skipped lines instead of reporting
+/// them, so callers (notably `rite doctor`) can surface the details.
+pub fn read_records_reporting<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<(Vec<T>, Vec<SkippedLine>)> {
+    let mut records = Vec::new();
+    let skipped = scan_records(path, Some(&mut records))?;
+    Ok((records, skipped))
+}
+
+/// Parse every line of a JSONL file as `T` and return only the lines that
+/// failed. Nothing is retained, so this is cheap enough to run over every file
+/// in the data directory (used by `rite doctor`).
+pub fn scan_skipped<T: DeserializeOwned>(path: &Path) -> Result<Vec<SkippedLine>> {
+    scan_records::<T>(path, None)
+}
+
+/// Shared implementation of the whole-file read.
+///
+/// When `records` is `Some`, successfully parsed records are collected into it;
+/// when `None` they are parsed and dropped. Either way, unparsable lines are
+/// returned with their file/line/offset context.
+fn scan_records<T: DeserializeOwned>(
+    path: &Path,
+    mut records: Option<&mut Vec<T>>,
+) -> Result<Vec<SkippedLine>> {
+    let mut skipped = Vec::new();
+
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(skipped);
     }
 
     let file =
@@ -145,36 +318,36 @@ pub fn read_records<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     file.lock_shared()
         .with_context(|| format!("Failed to acquire shared lock on: {}", path.display()))?;
 
-    let reader = BufReader::new(&file);
-    let mut records = Vec::new();
+    let mut reader = BufReader::new(&file);
+    let mut raw = Vec::new();
+    let mut byte_offset = 0u64;
+    let mut line_no = 0u64;
 
-    for (line_num, line_result) in reader.lines().enumerate() {
-        let line = line_result.with_context(|| {
+    loop {
+        raw.clear();
+        let bytes_read = reader.read_until(b'\n', &mut raw).with_context(|| {
             format!(
                 "Failed to read line {} from: {}",
-                line_num + 1,
+                line_no + 1,
                 path.display()
             )
         })?;
-
-        // Skip empty lines
-        if line.trim().is_empty() {
-            continue;
+        if bytes_read == 0 {
+            break;
         }
 
-        let record: T = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "Failed to parse line {} in {}: {}",
-                line_num + 1,
-                path.display(),
-                line
-            )
-        })?;
+        let line_start = byte_offset;
+        byte_offset += bytes_read as u64;
+        line_no += 1;
 
-        records.push(record);
+        if let Some(record) = parse_line::<T>(&raw, path, Some(line_no), line_start, &mut skipped)
+            && let Some(records) = records.as_mut()
+        {
+            records.push(record);
+        }
     }
 
-    Ok(records)
+    Ok(skipped)
 }
 
 /// Read records from a JSONL file starting at a byte offset.
@@ -218,32 +391,34 @@ pub fn read_records_from_offset_limited<T: DeserializeOwned>(
 
     let mut reader = BufReader::new(&file);
     let mut records = Vec::new();
+    let mut skipped = Vec::new();
     let mut new_offset = offset;
+    let mut raw = Vec::new();
 
     loop {
-        let mut line = String::new();
+        raw.clear();
         let bytes_read = reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut raw)
             .with_context(|| format!("Failed to read from: {}", path.display()))?;
         if bytes_read == 0 {
             break;
         }
 
-        new_offset = reader.stream_position()?;
+        let line_start = new_offset;
+        new_offset += bytes_read as u64;
 
-        if line.trim().is_empty() {
-            continue;
-        }
+        // Absolute line numbers are unknown when starting mid-file, so the
+        // byte offset carries the position context here.
+        if let Some(record) = parse_line::<T>(&raw, path, None, line_start, &mut skipped) {
+            records.push(record);
 
-        let record: T = serde_json::from_str(&line)
-            .with_context(|| format!("Failed to parse in {}: {}", path.display(), line))?;
-
-        records.push(record);
-
-        if limit.is_some_and(|limit| records.len() >= limit) {
-            break;
+            if limit.is_some_and(|limit| records.len() >= limit) {
+                break;
+            }
         }
     }
+
+    report_skipped(&skipped);
 
     if limit.is_none() {
         // Get the new offset while still holding the shared lock. Reopening
@@ -432,6 +607,158 @@ mod tests {
         append_records(&path, &records).unwrap();
 
         assert_eq!(count_records(&path).unwrap(), 2);
+    }
+
+    /// Write records with an unreadable line wedged in the middle.
+    fn file_with_bad_line(path: &Path) {
+        use std::io::Write;
+
+        append_record(
+            path,
+            &TestRecord {
+                id: 1,
+                name: "first".to_string(),
+            },
+        )
+        .unwrap();
+
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        // Shape of a record a newer rite might write: right type name, wrong shape.
+        writeln!(file, r#"{{"id":"not-a-number","name":"future"}}"#).unwrap();
+        drop(file);
+
+        append_record(
+            path,
+            &TestRecord {
+                id: 3,
+                name: "third".to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_read_records_skips_unparsable_line() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+        file_with_bad_line(&path);
+
+        let records: Vec<TestRecord> = read_records(&path).unwrap();
+        assert_eq!(records.len(), 2, "one bad line must not lose the good ones");
+        assert_eq!(records[0].id, 1);
+        assert_eq!(records[1].id, 3);
+    }
+
+    #[test]
+    fn test_read_records_reporting_keeps_line_context() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+        file_with_bad_line(&path);
+
+        let (records, skipped) = read_records_reporting::<TestRecord>(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].path, path);
+        assert_eq!(skipped[0].line, Some(2));
+        assert!(skipped[0].byte_offset > 0);
+        assert!(!skipped[0].error.is_empty());
+        // Display carries both the file and the position.
+        let rendered = skipped[0].to_string();
+        assert!(rendered.contains(&path.display().to_string()));
+        assert!(rendered.contains(":2:"));
+    }
+
+    #[test]
+    fn test_scan_skipped_counts_without_collecting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+        file_with_bad_line(&path);
+
+        let skipped = scan_skipped::<TestRecord>(&path).unwrap();
+        assert_eq!(skipped.len(), 1);
+
+        // A clean file reports nothing, and a missing file is not an error.
+        let clean = temp.path().join("clean.jsonl");
+        append_record(
+            &clean,
+            &TestRecord {
+                id: 1,
+                name: "ok".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(scan_skipped::<TestRecord>(&clean).unwrap().is_empty());
+        assert!(
+            scan_skipped::<TestRecord>(&temp.path().join("missing.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_read_from_offset_skips_unparsable_line() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+        file_with_bad_line(&path);
+
+        let (records, offset) = read_records_from_offset::<TestRecord>(&path, 0).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
+
+        // Limits count parsed records, and the cursor stays usable across a skip.
+        let (first, next) =
+            read_records_from_offset_limited::<TestRecord>(&path, 0, Some(1)).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, 1);
+        let (rest, _) =
+            read_records_from_offset_limited::<TestRecord>(&path, next, Some(1)).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, 3, "the skipped line must not stall the cursor");
+    }
+
+    #[test]
+    fn test_append_if_tolerates_unparsable_line() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+        file_with_bad_line(&path);
+
+        let new = TestRecord {
+            id: 4,
+            name: "fourth".to_string(),
+        };
+        let appended =
+            append_if(&path, &new, |existing: &[TestRecord]| existing.len() == 2).unwrap();
+        assert!(appended);
+
+        let records: Vec<TestRecord> = read_records(&path).unwrap();
+        assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn test_non_utf8_line_is_skipped() {
+        use std::io::Write;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.jsonl");
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        }
+        append_record(
+            &path,
+            &TestRecord {
+                id: 7,
+                name: "after".to_string(),
+            },
+        )
+        .unwrap();
+
+        let (records, skipped) = read_records_reporting::<TestRecord>(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 7);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].error.contains("UTF-8"));
     }
 
     #[test]
