@@ -207,11 +207,11 @@ rite wait -L review -t 120
 Hooks let you trigger shell commands when messages arrive on channels. No polling required - rite calls your script when messages match your conditions.
 
 ```bash
-# Add a hook to run a script on new messages
-rite hooks add general --command "./scripts/notify.sh" -m "Notify on general messages"
+# Fire when an agent is @mentioned on a channel
+rite hooks add --channel general --mention reviewer --cwd . -- ./scripts/review.sh
 
-# Add a hook with a label filter
-rite hooks add deployments --label "production" --command "./scripts/deploy.sh"
+# Fire when nobody holds a claim (i.e. that agent isn't already running)
+rite hooks add --channel deploy --claim "agent://deployer" --ttl 600 --cwd . -- ./scripts/deploy.sh
 
 # List all hooks
 rite hooks list
@@ -222,6 +222,38 @@ rite hooks test <hook-id>
 # Remove a hook
 rite hooks remove <hook-id>
 ```
+
+#### One spawn at a time: `--lease`
+
+`--lease` gives a hook at most one live spawn **per channel**, and batches
+whatever arrives while that spawn is running:
+
+```bash
+rite hooks add --channel rite --mention rite-dev \
+  --lease --claim-owner rite-dev --cwd . -- vessel spawn rite-dev
+```
+
+- The lease is an ordinary claim on a rite-owned pattern,
+  `spawn://<hook-id>/<channel>`, so `rite claims list` shows exactly who is
+  holding a channel and `rite hooks list` shows how much is queued behind it.
+- Triggers that arrive while the lease is held are **queued**, deduplicated
+  (same sender + same body collapses), and handed to the next spawn through
+  `RITE_BATCH_MESSAGE_IDS` (comma-separated, oldest first, triggering message
+  last) and `RITE_BATCH_COUNT`. Look each one up with `rite messages get <id>`.
+- A lease whose holder stops heartbeating (see `rite claims list`, `stale`)
+  is **superseded**: the next trigger takes its own lease and spawns. Nothing
+  releases the dead holder's claim — it stays in the log, still active, still
+  reported. A hook must never stop firing because an agent was killed.
+- `--lease-ttl` bounds that recovery for a holder that never reported
+  presence at all (default: the hook's claim TTL, else 3600s).
+- Set `--claim-owner` to the agent being spawned. Without it the lease is
+  owned by whoever sent the triggering message, so presence tracks the sender
+  rather than the spawn and only the TTL can clear a stuck lease.
+
+**`--cooldown` is deprecated.** A wall clock cannot tell "still running" from
+"finished early": too short double-spawns, too long silently drops everything
+that arrived inside the window. It still works exactly as before for every
+hook that has no lease, and is ignored on hooks that have one.
 
 ### Subscriptions
 

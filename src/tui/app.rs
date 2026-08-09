@@ -938,6 +938,7 @@ impl App {
         if !hook_flags.suppress_all() {
             let ch = channel.clone();
             let mid = msg.id.to_string();
+            let body = text.clone();
             let meta = msg.meta.clone();
             let agent = agent_name.clone();
             let mentions = msg.mentions.clone();
@@ -945,6 +946,7 @@ impl App {
                 crate::cli::hooks::evaluate_hooks_with_flags(
                     &ch,
                     &mid,
+                    &body,
                     meta.as_ref(),
                     &agent,
                     &mentions,

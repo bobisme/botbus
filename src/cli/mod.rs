@@ -517,9 +517,26 @@ pub enum HooksCommands {
         #[arg(long)]
         cwd: PathBuf,
 
-        /// Cooldown between firings (e.g., "30s", "5m", "1h"; default: 30s)
+        /// Cooldown between firings (e.g., "30s", "5m", "1h"; default: 30s).
+        /// Deprecated: prefer --lease, which cannot double-spawn or silently
+        /// drop messages that arrive inside the window. Ignored when --lease is set.
         #[arg(long)]
         cooldown: Option<String>,
+
+        /// Allow one live spawn per (hook, channel), enforced by a claim rather
+        /// than a wall clock. Triggers that arrive while a spawn is live are
+        /// batched into the next one instead of being dropped.
+        #[arg(long)]
+        lease: bool,
+
+        /// Seconds a spawn lease may be held before it lapses
+        /// (default: the hook's claim TTL, else 3600)
+        #[arg(long, requires = "lease")]
+        lease_ttl: Option<u64>,
+
+        /// Maximum triggers handed to a single spawn (default: 50)
+        #[arg(long, requires = "lease")]
+        max_batch: Option<usize>,
 
         /// Claim TTL in seconds (acquire claim when hook fires, hold for this duration)
         #[arg(long, conflicts_with = "release_on_exit")]

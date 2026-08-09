@@ -196,6 +196,14 @@ pub fn hooks_audit_path() -> PathBuf {
     data_dir().join("hooks_audit.jsonl")
 }
 
+/// Get the hook_queue.jsonl path (triggers batched behind a spawn lease).
+///
+/// Additive: a rite that predates spawn leases never opens this file, so its
+/// presence in a synced data directory is inert for older builds.
+pub fn hook_queue_path() -> PathBuf {
+    data_dir().join("hook_queue.jsonl")
+}
+
 /// Get the Telegram config path in the cache directory.
 pub fn telegram_config_path() -> PathBuf {
     cache_dir().join("telegram.json")

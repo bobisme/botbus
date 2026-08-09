@@ -1,6 +1,135 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use ulid::Ulid;
+
+/// Reserved claim scheme for hook spawn leases.
+///
+/// A lease is an ordinary claim in `claims.jsonl` — same file, same atomic
+/// check-and-stake, visible in `rite claims list`. What makes it a lease is
+/// only the scheme: rite derives the pattern
+/// (`spawn://<hook-id>/<channel>`), so no human and no agent ever stakes one
+/// by hand.
+///
+/// That reservation is load-bearing. `crate::cli::hooks` lets a *provably
+/// abandoned* lease be stepped over (see the supersession rule there), and
+/// confining that rule to a scheme rite owns guarantees it can never apply
+/// to a claim someone else staked — `src/**`, `agent://foo`, `bone://…` keep
+/// the ordinary, never-bypassed claim semantics.
+pub const LEASE_SCHEME: &str = "spawn://";
+
+/// Fallback lease TTL when neither the lease nor the hook's claim says.
+///
+/// The TTL is a backstop, not the primary release path: it bounds how long a
+/// lease whose holder never reported presence at all can wedge a channel.
+/// One hour is long enough not to cut a working agent off mid-task, and
+/// short enough that a wedged channel recovers on its own.
+pub const DEFAULT_LEASE_TTL_SECS: u64 = 3600;
+
+/// Default cap on how many triggers one spawn is handed.
+pub const DEFAULT_MAX_BATCH: usize = 50;
+
+/// Build the lease pattern for a (hook, channel) pair.
+///
+/// The channel is the one that actually fired, not `hook.channel`, so a
+/// wildcard (`*`) hook gets one lease per channel rather than one globally.
+pub fn spawn_lease_pattern(hook_id: &str, channel: &str) -> String {
+    format!("{}{}/{}", LEASE_SCHEME, hook_id, channel)
+}
+
+/// Per-(hook, channel) spawn lease: at most one live spawn at a time, with
+/// triggers that arrive while it is held batched into the next spawn.
+///
+/// Opt-in per hook (`rite hooks add --lease`). Hooks without it keep the
+/// wall-clock [`Hook::cooldown_secs`] behaviour untouched.
+///
+/// Plain struct on purpose — no tagged enum, so it cannot interact with the
+/// `crate::core::wire` corruption rules — and every field is optional, so an
+/// older rite ignores the whole thing and a newer one can add fields without
+/// making this build reject the record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnLease {
+    /// Seconds the lease may be held before it expires.
+    /// Defaults to the hook's claim TTL, then [`DEFAULT_LEASE_TTL_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+
+    /// Maximum triggers handed to a single spawn (default
+    /// [`DEFAULT_MAX_BATCH`]). Anything over the cap stays queued for the
+    /// spawn after that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch: Option<usize>,
+}
+
+/// A hook trigger that arrived while the (hook, channel) spawn lease was
+/// held, kept so the next spawn gets it instead of it being dropped.
+///
+/// Append-only with latest-record-per-`id` wins, exactly like claims: an
+/// entry is written once with `delivered: false`, then re-written with
+/// `delivered: true` once a spawn has actually been handed it. Deliberately
+/// a flat struct with no variant tag, so it never reaches the
+/// `crate::core::wire` known-tag/unknown-tag policy, and every added field
+/// must stay `#[serde(default)]` so an older build can read a newer file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedTrigger {
+    /// When the trigger was queued.
+    pub ts: DateTime<Utc>,
+
+    /// Queue entry ID (not the message ID — one message can queue for
+    /// several hooks).
+    pub id: Ulid,
+
+    /// Hook the trigger is queued for.
+    pub hook_id: String,
+
+    /// Channel the trigger arrived on.
+    pub channel: String,
+
+    /// Message that triggered the hook.
+    pub message_id: String,
+
+    /// Agent that sent the triggering message.
+    pub agent: String,
+
+    /// Identity used to collapse duplicate triggers within one batch —
+    /// same sender, same message body.
+    pub dedup_key: String,
+
+    /// False while queued; true on the record written when a spawn has been
+    /// handed this trigger.
+    #[serde(default)]
+    pub delivered: bool,
+}
+
+impl QueuedTrigger {
+    pub fn new(
+        hook_id: impl Into<String>,
+        channel: impl Into<String>,
+        message_id: impl Into<String>,
+        agent: impl Into<String>,
+        dedup_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            ts: Utc::now(),
+            id: Ulid::new(),
+            hook_id: hook_id.into(),
+            channel: channel.into(),
+            message_id: message_id.into(),
+            agent: agent.into(),
+            dedup_key: dedup_key.into(),
+            delivered: false,
+        }
+    }
+
+    /// The record that marks this entry as handed to a spawn.
+    pub fn delivered(&self) -> Self {
+        Self {
+            delivered: true,
+            ts: Utc::now(),
+            ..self.clone()
+        }
+    }
+}
 
 /// A channel hook that triggers a command when a message is sent to a channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,7 +149,14 @@ pub struct Hook {
     /// Working directory for the command
     pub cwd: PathBuf,
 
-    /// Minimum seconds between firings
+    /// Minimum seconds between firings.
+    ///
+    /// **Deprecated** in favour of [`Hook::lease`]: a wall clock cannot tell
+    /// "a spawn is still running" from "a spawn finished early", so it
+    /// double-spawns when set too short and silently drops everything that
+    /// arrives inside the window when set too long. Still honoured exactly as
+    /// before for every hook without a lease — which is every hook written by
+    /// a rite that predates leases.
     pub cooldown_secs: u64,
 
     /// Last time this hook was fired
@@ -58,6 +194,12 @@ pub struct Hook {
     /// E.g., require_flag = "dev" means the hook only fires on messages containing "!dev".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_flag: Option<String>,
+
+    /// Per-(hook, channel) spawn lease. `None` — the case for every hook
+    /// written before this field existed — keeps the [`Hook::cooldown_secs`]
+    /// behaviour verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<SpawnLease>,
 
     /// Whether this hook is active
     pub active: bool,
@@ -154,6 +296,41 @@ impl Hook {
         // Fallback: full ULID (should never happen with < 100 hooks)
         format!("hk-{}", ulid_str)
     }
+
+    /// Whether this hook uses a spawn lease instead of the wall-clock cooldown.
+    pub fn uses_lease(&self) -> bool {
+        self.lease.is_some()
+    }
+
+    /// Lease pattern for a firing on `channel`.
+    pub fn lease_pattern(&self, channel: &str) -> String {
+        spawn_lease_pattern(&self.id, channel)
+    }
+
+    /// Seconds a lease for this hook is held before it expires.
+    ///
+    /// Falls back to the hook's own claim TTL so a lease-enabled hook does
+    /// not hold the channel longer than the claim it stakes alongside it.
+    pub fn lease_ttl_secs(&self) -> u64 {
+        self.lease
+            .as_ref()
+            .and_then(|l| l.ttl_secs)
+            .or(match self.claim_release {
+                Some(ClaimRelease::Ttl { secs }) => Some(secs),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_LEASE_TTL_SECS)
+            .max(1)
+    }
+
+    /// Maximum triggers handed to one spawn of this hook.
+    pub fn lease_max_batch(&self) -> usize {
+        self.lease
+            .as_ref()
+            .and_then(|l| l.max_batch)
+            .unwrap_or(DEFAULT_MAX_BATCH)
+            .max(1)
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +373,7 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: None,
         };
@@ -264,12 +442,152 @@ mod tests {
         assert!(matches!(parsed, ClaimRelease::OnExit));
     }
 
+    fn lease_hook(lease: Option<SpawnLease>) -> Hook {
+        Hook {
+            id: "hk-lse".to_string(),
+            channel: "deploy".to_string(),
+            condition: HookCondition::MentionReceived {
+                agent: "worker".to_string(),
+            },
+            command: vec!["echo".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            cooldown_secs: 30,
+            last_fired: None,
+            created_at: Utc::now(),
+            created_by: None,
+            claim_release: Some(ClaimRelease::Ttl { secs: 600 }),
+            claim_pattern: None,
+            claim_owner: None,
+            priority: 0,
+            require_flag: None,
+            lease,
+            active: true,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn test_lease_pattern_is_per_hook_and_channel() {
+        let hook = lease_hook(Some(SpawnLease::default()));
+        assert_eq!(hook.lease_pattern("rite"), "spawn://hk-lse/rite");
+        // A wildcard hook leases per firing channel, never once globally.
+        assert_ne!(hook.lease_pattern("rite"), hook.lease_pattern("manifold"));
+        assert!(hook.lease_pattern("rite").starts_with(LEASE_SCHEME));
+    }
+
+    #[test]
+    fn test_lease_ttl_falls_back_to_claim_ttl_then_default() {
+        // Explicit lease TTL wins.
+        let explicit = lease_hook(Some(SpawnLease {
+            ttl_secs: Some(120),
+            max_batch: None,
+        }));
+        assert_eq!(explicit.lease_ttl_secs(), 120);
+
+        // Otherwise the hook's own claim TTL, so the lease never outlives it.
+        let from_claim = lease_hook(Some(SpawnLease::default()));
+        assert_eq!(from_claim.lease_ttl_secs(), 600);
+
+        // Otherwise the documented default backstop.
+        let mut no_claim_ttl = lease_hook(Some(SpawnLease::default()));
+        no_claim_ttl.claim_release = Some(ClaimRelease::OnExit);
+        assert_eq!(no_claim_ttl.lease_ttl_secs(), DEFAULT_LEASE_TTL_SECS);
+    }
+
+    #[test]
+    fn test_lease_max_batch_defaults_and_floor() {
+        assert_eq!(
+            lease_hook(Some(SpawnLease::default())).lease_max_batch(),
+            DEFAULT_MAX_BATCH
+        );
+        // A zero cap would mean "deliver nothing", which is a silent drop.
+        assert_eq!(
+            lease_hook(Some(SpawnLease {
+                ttl_secs: None,
+                max_batch: Some(0),
+            }))
+            .lease_max_batch(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_lease_omitted_when_absent() {
+        let hook = lease_hook(None);
+        assert!(!hook.uses_lease());
+        let json = serde_json::to_string(&hook).unwrap();
+        assert!(
+            !json.contains("\"lease\""),
+            "a hook without a lease must serialize byte-identically to before: {json}"
+        );
+    }
+
+    #[test]
+    fn test_lease_roundtrip() {
+        let hook = lease_hook(Some(SpawnLease {
+            ttl_secs: Some(900),
+            max_batch: Some(10),
+        }));
+        let json = serde_json::to_string(&hook).unwrap();
+        let parsed: Hook = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.lease,
+            Some(SpawnLease {
+                ttl_secs: Some(900),
+                max_batch: Some(10)
+            })
+        );
+    }
+
+    /// A lease record written by a newer rite that has grown fields must not
+    /// make this build reject the hook — the whole point of keeping the lease
+    /// a flat, all-optional struct rather than a tagged variant.
+    #[test]
+    fn test_lease_tolerates_unknown_fields() {
+        let json = r#"{"id":"hk-fut","channel":"test","condition":{"type":"claim_available","pattern":"x"},"command":["echo"],"cwd":"/tmp","cooldown_secs":30,"created_at":"2025-01-01T00:00:00Z","lease":{"ttl_secs":42,"steer_mode":"inject"},"active":true}"#;
+        let hook: Hook = serde_json::from_str(json).unwrap();
+        assert!(hook.uses_lease());
+        assert_eq!(hook.lease_ttl_secs(), 42);
+        assert_eq!(hook.lease_max_batch(), DEFAULT_MAX_BATCH);
+    }
+
+    #[test]
+    fn test_queued_trigger_roundtrip_and_delivery() {
+        let entry = QueuedTrigger::new("hk-abc", "rite", "01ABC", "sender", "deadbeef");
+        assert!(!entry.delivered);
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: QueuedTrigger = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, entry.id);
+        assert_eq!(parsed.hook_id, "hk-abc");
+        assert!(!parsed.delivered);
+
+        // The delivery record keeps the same entry ID so latest-wins
+        // collapses the pair into one delivered entry.
+        let delivered = entry.delivered();
+        assert_eq!(delivered.id, entry.id);
+        assert!(delivered.delivered);
+    }
+
+    /// A queue entry written by an older rite has no `delivered` field at
+    /// all; it must read as still-pending rather than failing the parse.
+    #[test]
+    fn test_queued_trigger_missing_delivered_defaults_to_pending() {
+        let json = r#"{"ts":"2025-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hook_id":"hk-abc","channel":"rite","message_id":"01ABC","agent":"sender","dedup_key":"deadbeef"}"#;
+        let parsed: QueuedTrigger = serde_json::from_str(json).unwrap();
+        assert!(!parsed.delivered);
+    }
+
     #[test]
     fn test_hook_backward_compat_no_claim_release() {
         // Simulate old hook JSON without claim_release, created_by, priority, or description fields
         let json = r#"{"id":"hk-old","channel":"test","condition":{"type":"claim_available","pattern":"x"},"command":["echo"],"cwd":"/tmp","cooldown_secs":30,"created_at":"2025-01-01T00:00:00Z","active":true}"#;
         let hook: Hook = serde_json::from_str(json).unwrap();
         assert!(hook.claim_release.is_none());
+        assert!(
+            !hook.uses_lease(),
+            "a hook that predates leases must keep its cooldown behaviour"
+        );
         assert!(hook.created_by.is_none());
         assert_eq!(hook.priority, 0);
         assert!(hook.require_flag.is_none());
@@ -295,6 +613,7 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: Some("botbox:respond:general".to_string()),
         };
@@ -328,6 +647,7 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: None,
         };
@@ -392,6 +712,7 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: Some("dev".to_string()),
+            lease: None,
             active: true,
             description: None,
         };
@@ -422,6 +743,7 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: None,
         };

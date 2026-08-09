@@ -15,7 +15,8 @@ use crate::core::identity::resolve_agent;
 use crate::core::message::Message;
 use crate::core::names::is_valid_name;
 use crate::core::project::{
-    channels_dir, claims_path, data_dir, hooks_path, index_path, state_path, statuses_path,
+    channels_dir, claims_path, data_dir, hook_queue_path, hooks_path, index_path, state_path,
+    statuses_path,
 };
 use crate::core::status::AgentStatusEntry;
 use crate::storage::jsonl::{SkippedLine, scan_skipped};
@@ -434,6 +435,11 @@ fn check_record_readability(report: &mut DoctorReport) {
     );
     scan(
         scan_skipped::<crate::core::hook::Hook>(&hooks_path()),
+        &mut skipped,
+        &mut files_scanned,
+    );
+    scan(
+        scan_skipped::<crate::core::hook::QueuedTrigger>(&hook_queue_path()),
         &mut skipped,
         &mut files_scanned,
     );

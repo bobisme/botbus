@@ -11,9 +11,14 @@ use tracing::{info, instrument, warn};
 use super::OutputFormat;
 use crate::core::claim::FileClaim;
 use crate::core::flags::HookFlags;
-use crate::core::hook::{ClaimRelease, Hook, HookCondition, HookFiring, shell_display};
+use crate::core::hook::{
+    ClaimRelease, Hook, HookCondition, HookFiring, QueuedTrigger, SpawnLease, shell_display,
+};
 use crate::core::message::{Message, MessageMeta, SystemEvent};
-use crate::core::project::{channel_path, claims_path, hooks_audit_path, hooks_path};
+use crate::core::presence::{self, PRESENCE_TTL_SECS};
+use crate::core::project::{
+    channel_path, claims_path, hook_queue_path, hooks_audit_path, hooks_path,
+};
 use crate::storage::jsonl::{append_if, append_record, read_records};
 
 /// Parse a cooldown duration string (e.g., "30s", "5m", "1h").
@@ -56,6 +61,9 @@ pub fn add(
     priority: i32,
     require_flag: Option<String>,
     description: Option<String>,
+    lease: bool,
+    lease_ttl: Option<u64>,
+    max_batch: Option<usize>,
     agent: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
@@ -146,6 +154,11 @@ pub fn add(
         None
     };
 
+    let lease = lease.then_some(SpawnLease {
+        ttl_secs: lease_ttl,
+        max_batch,
+    });
+
     let hook = Hook {
         id: Hook::generate_id(&existing_ids),
         channel: hook_channel.clone(),
@@ -161,6 +174,7 @@ pub fn add(
         claim_owner,
         priority,
         require_flag: require_flag.map(|f| f.to_lowercase()),
+        lease,
         active: true,
         description,
     };
@@ -176,7 +190,31 @@ pub fn add(
             println!("  channel: #{}", hook.channel);
             println!("  condition: {:?}", hook.condition);
             println!("  command: {:?}", hook.command);
-            println!("  cooldown: {}s", hook.cooldown_secs);
+            if hook.uses_lease() {
+                println!(
+                    "  lease: {} (ttl: {}s, max-batch: {})",
+                    hook.lease_pattern(&hook.channel),
+                    hook.lease_ttl_secs(),
+                    hook.lease_max_batch()
+                );
+                if hook.claim_owner.is_none() {
+                    // Presence is what tells a wedged lease from a working
+                    // one, and presence is per agent — so a lease owned by
+                    // whoever happened to send the message tracks the sender,
+                    // not the spawn. Say so rather than let it surprise.
+                    println!(
+                        "  {}",
+                        "note: without --claim-owner the lease is owned by the triggering sender; \
+                         a stuck lease then only clears at its TTL"
+                            .yellow()
+                    );
+                }
+            } else {
+                println!(
+                    "  cooldown: {}s (deprecated — prefer --lease)",
+                    hook.cooldown_secs
+                );
+            }
         }
     }
 
@@ -198,6 +236,11 @@ struct HookInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     last_fired: Option<String>,
+    /// Spawn lease config, when the hook uses one instead of `cooldown_secs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease: Option<SpawnLease>,
+    /// Triggers queued behind this hook's lease, waiting for the next spawn.
+    pending: usize,
     active: bool,
 }
 
@@ -216,6 +259,13 @@ pub fn list(format: OutputFormat) -> Result<()> {
     let mut hooks: Vec<&Hook> = active.values().collect();
     hooks.sort_by_key(|h| &h.created_at);
 
+    // Pending counts make a wedged lease visible: a hook whose queue only
+    // grows is a channel that has stopped spawning.
+    let mut pending_counts: HashMap<String, usize> = HashMap::new();
+    for entry in pending_triggers() {
+        *pending_counts.entry(entry.hook_id).or_default() += 1;
+    }
+
     let infos: Vec<HookInfo> = hooks
         .iter()
         .map(|h| HookInfo {
@@ -229,6 +279,8 @@ pub fn list(format: OutputFormat) -> Result<()> {
             require_flag: h.require_flag.clone(),
             description: h.description.clone(),
             last_fired: h.last_fired.map(|t| t.to_rfc3339()),
+            lease: h.lease.clone(),
+            pending: *pending_counts.get(&h.id).unwrap_or(&0),
             active: h.active,
         })
         .collect();
@@ -251,15 +303,29 @@ pub fn list(format: OutputFormat) -> Result<()> {
                         .last_fired
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_else(|| "never".to_string());
+                    let throttle = if h.uses_lease() {
+                        format!("lease: {}s", h.lease_ttl_secs())
+                    } else {
+                        format!("cooldown: {}s", h.cooldown_secs)
+                    };
                     println!(
-                        "  {} #{} → {:?} (priority: {}, cooldown: {}s, last: {})",
+                        "  {} #{} → {:?} (priority: {}, {}, last: {})",
                         h.id.cyan(),
                         h.channel,
                         h.command,
                         h.priority,
-                        h.cooldown_secs,
+                        throttle,
                         last.dimmed()
                     );
+                    if h.uses_lease() {
+                        let pending = *pending_counts.get(&h.id).unwrap_or(&0);
+                        println!(
+                            "    lease: {} (max-batch: {}, queued: {})",
+                            h.lease_pattern(&h.channel),
+                            h.lease_max_batch(),
+                            pending
+                        );
+                    }
                     match &h.condition {
                         HookCondition::ClaimAvailable { pattern } => {
                             println!("    if-claim-available: {}", pattern);
@@ -375,19 +441,37 @@ pub fn test(hook_id: String, format: OutputFormat) -> Result<()> {
 
     let now = Utc::now();
 
-    // Check cooldown
-    let cooldown_ok = match hook.last_fired {
-        Some(last) => (now - last).num_seconds() >= hook.cooldown_secs as i64,
-        None => true,
+    // Cooldown only gates hooks without a lease.
+    let cooldown_ok = if hook.uses_lease() {
+        true
+    } else {
+        match hook.last_fired {
+            Some(last) => (now - last).num_seconds() >= hook.cooldown_secs as i64,
+            None => true,
+        }
+    };
+
+    // Lease state for the hook's own channel. A wildcard hook leases per
+    // firing channel, so this is the template rather than the only lease.
+    let (lease_pattern, lease_free, pending) = if hook.uses_lease() {
+        let pattern = hook.lease_pattern(&hook.channel);
+        let claims: Vec<FileClaim> = read_records(&claims_path()).unwrap_or_default();
+        let free = lease_available(&pattern, &claims, now);
+        let pending = pending_for(&hook.id, &hook.channel).len();
+        (Some(pattern), Some(free), pending)
+    } else {
+        (None, None, 0)
     };
 
     // Evaluate condition (MentionReceived hooks will always return false in test mode)
     let condition_result = evaluate_condition(&hook.condition, &[])?;
 
-    let would_execute = cooldown_ok && condition_result;
+    let would_execute = cooldown_ok && condition_result && lease_free.unwrap_or(true);
 
     let reason = if !cooldown_ok {
         Some("cooldown active".to_string())
+    } else if lease_free == Some(false) {
+        Some("spawn lease held".to_string())
     } else if !condition_result {
         Some("condition not met".to_string())
     } else {
@@ -402,6 +486,11 @@ pub fn test(hook_id: String, format: OutputFormat) -> Result<()> {
         would_execute: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lease_pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lease_free: Option<bool>,
+        pending: usize,
         command: Vec<String>,
         cwd: String,
     }
@@ -412,6 +501,9 @@ pub fn test(hook_id: String, format: OutputFormat) -> Result<()> {
         condition_result,
         would_execute,
         reason,
+        lease_pattern,
+        lease_free,
+        pending,
         command: hook.command.clone(),
         cwd: hook.cwd.to_string_lossy().to_string(),
     };
@@ -422,14 +514,27 @@ pub fn test(hook_id: String, format: OutputFormat) -> Result<()> {
         }
         OutputFormat::Pretty | OutputFormat::Text => {
             println!("{} Hook {} dry-run:", "Test:".green(), hook.id.cyan());
-            println!(
-                "  cooldown: {}",
-                if cooldown_ok {
-                    "ok".green().to_string()
-                } else {
-                    "active (skipped)".red().to_string()
-                }
-            );
+            if let Some(pattern) = &result.lease_pattern {
+                println!(
+                    "  lease {}: {} (queued: {})",
+                    pattern,
+                    if result.lease_free == Some(true) {
+                        "free".green().to_string()
+                    } else {
+                        "held (skipped, trigger would be queued)".red().to_string()
+                    },
+                    result.pending
+                );
+            } else {
+                println!(
+                    "  cooldown: {}",
+                    if cooldown_ok {
+                        "ok".green().to_string()
+                    } else {
+                        "active (skipped)".red().to_string()
+                    }
+                );
+            }
             println!(
                 "  condition: {}",
                 if condition_result {
@@ -488,6 +593,329 @@ fn is_claim_available(pattern: &str) -> Result<bool> {
     Ok(!is_pattern_held(pattern, &all_claims, now))
 }
 
+/// Hard cap on queued-but-undelivered triggers per (hook, channel).
+///
+/// A queue that grows without bound is its own failure mode: it would hand a
+/// returning agent a batch it can never work through, and it would grow
+/// `hook_queue.jsonl` forever while the channel is wedged. Past the cap new
+/// triggers are refused and audited, so the drop is visible instead of silent.
+const MAX_PENDING_PER_KEY: usize = 500;
+
+// ---------------------------------------------------------------------------
+// Spawn lease (bn-fsx0)
+//
+// `cooldown_secs` asks a wall clock a question it cannot answer: "is a spawn
+// from this hook still running?" The lease answers it directly. It is an
+// ordinary claim on a rite-owned pattern (`spawn://<hook>/<channel>`), staked
+// through the same atomic check-and-stake that hook claims already use, and
+// held by the agent the hook spawns.
+//
+// The failure mode that matters is a lease that is never released — the agent
+// is killed, the machine reboots — because a hook that stops firing forever is
+// far worse than one that fires twice. Two independent guards close that:
+//
+//   1. Presence (bn-12i6). A lease whose holder's heartbeat has lapsed is
+//      *superseded*: the next trigger stakes its own lease on the same
+//      pattern and proceeds. Nothing releases, expires, or rewrites the dead
+//      holder's claim — it stays in `claims.jsonl` exactly as written, still
+//      `active`, still reported (and now reported `stale`) by `claims list`.
+//      Staleness stays a report; what changes is only that *this* code
+//      declines to be blocked by a report of a dead agent, within a scheme it
+//      owns. Superseding requires the lease to be at least one presence TTL
+//      old, so an agent that simply has not checked in yet cannot have its
+//      lease taken the instant it is granted.
+//
+//   2. TTL. A holder that never recorded a heartbeat at all is `Unknown`, not
+//      `Lapsed`, and presence deliberately refuses to call that stale — so the
+//      lease's own expiry is the backstop that bounds the wedge.
+// ---------------------------------------------------------------------------
+
+/// Whether a claim on a lease pattern still blocks a new spawn.
+///
+/// `false` when the holder is provably gone: its heartbeat has lapsed *and*
+/// the lease has been held long enough that a live holder would have checked
+/// in at least once.
+fn lease_blocks(claim: &FileClaim, now: DateTime<Utc>) -> bool {
+    let age_secs = now.signed_duration_since(claim.ts).num_seconds();
+    if age_secs < PRESENCE_TTL_SECS {
+        // Too young to judge — a freshly spawned agent may not have run a
+        // single rite command yet, and its last heartbeat could be from a
+        // previous life.
+        return true;
+    }
+    !presence::agent_presence(&claim.agent).is_stale()
+}
+
+/// Whether `pattern` is free for a new spawn lease.
+fn lease_available(pattern: &str, existing_claims: &[FileClaim], now: DateTime<Utc>) -> bool {
+    // Latest record per claim ID wins, same as `is_pattern_held`.
+    let mut active: HashMap<ulid::Ulid, &FileClaim> = HashMap::new();
+    for claim in existing_claims {
+        active.insert(claim.id, claim);
+    }
+
+    !active.values().any(|claim| {
+        claim.active
+            && claim.expires_at > now
+            && claim.patterns.iter().any(|p| p == pattern)
+            && lease_blocks(claim, now)
+    })
+}
+
+/// Atomically take the spawn lease for a (hook, channel), or report it held.
+fn acquire_lease(pattern: &str, owner: &str, ttl_secs: u64) -> Option<FileClaim> {
+    let claim = FileClaim::with_message(
+        owner,
+        vec![pattern.to_string()],
+        ttl_secs,
+        Some("hook spawn lease".to_string()),
+    );
+    let pattern = pattern.to_string();
+    let acquired = append_if(&claims_path(), &claim, |existing| {
+        lease_available(&pattern, existing, Utc::now())
+    })
+    .unwrap_or(false);
+
+    acquired.then_some(claim)
+}
+
+/// Release a claim this evaluation staked itself.
+fn release_own_claim(claim: Option<&FileClaim>) {
+    if let Some(claim) = claim {
+        let _ = append_record(&claims_path(), &claim.release());
+    }
+}
+
+/// Stake a hook's own claim, atomically, exactly as before leases existed.
+fn stake_hook_claim(pattern: &str, agent: &str, ttl_secs: u64) -> Option<FileClaim> {
+    let claim = FileClaim::new(agent, vec![pattern.to_string()], ttl_secs);
+    let pattern = pattern.to_string();
+    let acquired = append_if(&claims_path(), &claim, |existing| {
+        !is_pattern_held(&pattern, existing, Utc::now())
+    })
+    .unwrap_or(false);
+
+    acquired.then_some(claim)
+}
+
+/// Identity two triggers must share to be collapsed into one: same sender,
+/// same message body. Hashed so the queue file stays a fixed width whatever
+/// the message length.
+fn dedup_key(agent: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(agent.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(body.trim().as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+/// Read every queued-but-undelivered trigger, latest record per entry ID.
+fn pending_triggers() -> Vec<QueuedTrigger> {
+    let all: Vec<QueuedTrigger> = read_records(&hook_queue_path()).unwrap_or_default();
+    let mut latest: HashMap<ulid::Ulid, QueuedTrigger> = HashMap::new();
+    for entry in all {
+        latest.insert(entry.id, entry);
+    }
+    let mut pending: Vec<QueuedTrigger> = latest.into_values().filter(|e| !e.delivered).collect();
+    pending.sort_by_key(|e| (e.ts, e.id));
+    pending
+}
+
+/// Queued-but-undelivered triggers for one (hook, channel), oldest first.
+fn pending_for(hook_id: &str, channel: &str) -> Vec<QueuedTrigger> {
+    pending_triggers()
+        .into_iter()
+        .filter(|e| e.hook_id == hook_id && e.channel == channel)
+        .collect()
+}
+
+/// Remember a trigger that arrived while the lease was held.
+///
+/// Returns the reason it was *not* queued, if it was not.
+fn enqueue_trigger(
+    hook: &Hook,
+    channel: &str,
+    message_id: &str,
+    sender: &str,
+    body: &str,
+    command_agent: &str,
+) -> Option<&'static str> {
+    // Never queue the spawned agent's own chatter behind its own lease:
+    // that turns "reply in the channel you were spawned for" into a
+    // self-sustaining spawn loop.
+    if sender == command_agent {
+        return Some("own message");
+    }
+
+    let pending = pending_for(&hook.id, channel);
+    if pending.len() >= MAX_PENDING_PER_KEY {
+        return Some("queue full");
+    }
+
+    let key = dedup_key(sender, body);
+    if pending.iter().any(|e| e.dedup_key == key) {
+        // Identical trigger already waiting — dedup at the door as well as at
+        // delivery, so a flapping sender cannot fill the queue.
+        return Some("duplicate");
+    }
+
+    let entry = QueuedTrigger::new(&hook.id, channel, message_id, sender, key);
+    match append_record(&hook_queue_path(), &entry) {
+        Ok(()) => None,
+        Err(error) => {
+            warn!(%error, hook_id = %hook.id, "failed to queue hook trigger");
+            Some("queue write failed")
+        }
+    }
+}
+
+/// Pick the queued triggers a spawn should be handed alongside `message_id`.
+///
+/// Deduplicates against the triggering message and against each other, and
+/// caps the batch — anything over the cap stays queued for the spawn after.
+fn drain_batch(hook: &Hook, channel: &str, trigger_key: &str) -> Vec<QueuedTrigger> {
+    let cap = hook.lease_max_batch().saturating_sub(1);
+    if cap == 0 {
+        return Vec::new();
+    }
+
+    let mut seen: std::collections::HashSet<String> =
+        std::collections::HashSet::from([trigger_key.to_string()]);
+    let mut batch = Vec::new();
+
+    for entry in pending_for(&hook.id, channel) {
+        if !seen.insert(entry.dedup_key.clone()) {
+            continue;
+        }
+        batch.push(entry);
+        if batch.len() >= cap {
+            break;
+        }
+    }
+
+    batch
+}
+
+/// Mark queued triggers as handed to a spawn. Only ever called after the
+/// spawn actually started, so a failed spawn leaves them queued.
+fn mark_delivered(batch: &[QueuedTrigger]) {
+    for entry in batch {
+        let _ = append_record(&hook_queue_path(), &entry.delivered());
+    }
+}
+
+/// Outcome of a hook's condition and claim acquisition.
+enum HookGate {
+    /// Fire, holding these claims.
+    Ready {
+        claim: Option<FileClaim>,
+        claim_ttl: Option<u64>,
+        claim_pattern: Option<String>,
+    },
+    /// Condition genuinely does not apply to this message (no mention).
+    /// There is nothing to batch — the message was never this hook's work.
+    ConditionFailed,
+    /// The hook's own claim is held: an instance is already working. This is
+    /// the case a lease-enabled hook batches instead of dropping.
+    Busy {
+        reason: &'static str,
+        condition_result: bool,
+    },
+}
+
+/// Evaluate a hook's condition and take its claim, unchanged from the
+/// pre-lease behaviour — the same atomic check-and-stake, the same audit
+/// reasons. Only the *classification* of the outcome is new.
+fn evaluate_gate(hook: &Hook, agent: &str, mentions: &[String]) -> HookGate {
+    match &hook.condition {
+        HookCondition::ClaimAvailable { pattern } => {
+            // Use claim_owner if specified, otherwise use message sender
+            let claim_agent = hook.claim_owner.as_deref().unwrap_or(agent);
+
+            match &hook.claim_release {
+                Some(ClaimRelease::Ttl { secs }) => {
+                    match stake_hook_claim(pattern, claim_agent, *secs) {
+                        Some(claim) => HookGate::Ready {
+                            claim: Some(claim),
+                            claim_ttl: Some(*secs),
+                            claim_pattern: Some(pattern.clone()),
+                        },
+                        None => HookGate::Busy {
+                            reason: "claim unavailable (atomic check)",
+                            condition_result: false,
+                        },
+                    }
+                }
+                Some(ClaimRelease::OnExit) => {
+                    // Large sentinel TTL; released explicitly after the command exits
+                    match stake_hook_claim(pattern, claim_agent, 86400) {
+                        Some(claim) => HookGate::Ready {
+                            claim: Some(claim),
+                            claim_ttl: None,
+                            claim_pattern: Some(pattern.clone()),
+                        },
+                        None => HookGate::Busy {
+                            reason: "claim unavailable (atomic check)",
+                            condition_result: false,
+                        },
+                    }
+                }
+                None => {
+                    // No claim release strategy - just check availability without claiming
+                    if is_claim_available(pattern).unwrap_or(false) {
+                        HookGate::Ready {
+                            claim: None,
+                            claim_ttl: None,
+                            claim_pattern: Some(pattern.clone()),
+                        }
+                    } else {
+                        HookGate::Busy {
+                            reason: "condition not met",
+                            condition_result: false,
+                        }
+                    }
+                }
+            }
+        }
+        HookCondition::MentionReceived {
+            agent: mention_agent,
+        } => {
+            if !mentions.iter().any(|m| m == mention_agent) {
+                return HookGate::ConditionFailed;
+            }
+
+            // If hook has an explicit --claim pattern, acquire it atomically
+            let (Some(pattern), Some(release)) = (&hook.claim_pattern, &hook.claim_release) else {
+                // No claim — just fire on mention
+                return HookGate::Ready {
+                    claim: None,
+                    claim_ttl: None,
+                    claim_pattern: None,
+                };
+            };
+
+            let claim_agent = hook.claim_owner.as_deref().unwrap_or(agent);
+            let (ttl, reported_ttl) = match release {
+                ClaimRelease::Ttl { secs } => (*secs, Some(*secs)),
+                ClaimRelease::OnExit => (86400, None),
+            };
+
+            match stake_hook_claim(pattern, claim_agent, ttl) {
+                Some(claim) => HookGate::Ready {
+                    claim: Some(claim),
+                    claim_ttl: reported_ttl,
+                    claim_pattern: Some(pattern.clone()),
+                },
+                None => HookGate::Busy {
+                    reason: "claim unavailable",
+                    condition_result: true,
+                },
+            }
+        }
+    }
+}
+
 /// Evaluate a hook condition.
 fn evaluate_condition(condition: &HookCondition, mentions: &[String]) -> Result<bool> {
     match condition {
@@ -502,14 +930,18 @@ pub struct HookFireResult {
     pub command_display: String,
     pub claim_pattern: Option<String>,
     pub claim_ttl: Option<u64>,
+    /// Triggers handed to this spawn, including the message that fired it.
+    /// Always 1 for hooks without a spawn lease.
+    pub batch_count: usize,
 }
 
 /// Evaluate all hooks for a channel after a message is sent.
 /// Returns info about hooks that fired (for caller to display).
-#[instrument(skip(meta, mentions), fields(channel = channel, message_id = message_id, agent = agent))]
+#[instrument(skip(meta, mentions, body), fields(channel = channel, message_id = message_id, agent = agent))]
 pub fn evaluate_hooks(
     channel: &str,
     message_id: &str,
+    body: &str,
     meta: Option<&MessageMeta>,
     agent: &str,
     mentions: &[String],
@@ -517,6 +949,7 @@ pub fn evaluate_hooks(
     evaluate_hooks_with_flags(
         channel,
         message_id,
+        body,
         meta,
         agent,
         mentions,
@@ -526,16 +959,20 @@ pub fn evaluate_hooks(
 
 /// Evaluate hooks with explicit flag control.
 /// Flags can suppress channel hooks, mention hooks, or both.
-#[instrument(skip(meta, mentions, flags), fields(channel = channel, message_id = message_id, agent = agent))]
+///
+/// `body` is the message text; it is only used to recognise duplicate
+/// triggers when batching behind a spawn lease.
+#[instrument(skip(meta, mentions, flags, body), fields(channel = channel, message_id = message_id, agent = agent))]
 pub fn evaluate_hooks_with_flags(
     channel: &str,
     message_id: &str,
+    body: &str,
     meta: Option<&MessageMeta>,
     agent: &str,
     mentions: &[String],
     flags: &HookFlags,
 ) -> Vec<HookFireResult> {
-    match evaluate_hooks_inner(channel, message_id, meta, agent, mentions, flags) {
+    match evaluate_hooks_inner(channel, message_id, body, meta, agent, mentions, flags) {
         Ok(results) => results,
         Err(error) => {
             warn!(%error, "hook evaluation failed");
@@ -547,6 +984,7 @@ pub fn evaluate_hooks_with_flags(
 fn evaluate_hooks_inner(
     channel: &str,
     message_id: &str,
+    body: &str,
     meta: Option<&MessageMeta>,
     agent: &str,
     mentions: &[String],
@@ -600,117 +1038,47 @@ fn evaluate_hooks_inner(
             continue;
         }
 
-        // Check cooldown
-        let cooldown_ok = match hook.last_fired {
-            Some(last) => (now - last).num_seconds() >= hook.cooldown_secs as i64,
-            None => true,
-        };
+        let command_agent = hook_command_agent(hook, agent).to_string();
 
-        if !cooldown_ok {
-            let firing = HookFiring {
-                ts: now,
-                hook_id: hook.id.clone(),
-                channel: channel.to_string(),
-                message_id: message_id.to_string(),
-                condition_result: false,
-                executed: false,
-                reason: Some("cooldown active".to_string()),
+        // Wall-clock cooldown — deprecated, and skipped entirely for hooks
+        // that carry a lease, since the lease answers the same question
+        // properly. Hooks without a lease (every hook written before leases
+        // existed) go through exactly the path they always did.
+        if !hook.uses_lease() {
+            let cooldown_ok = match hook.last_fired {
+                Some(last) => (now - last).num_seconds() >= hook.cooldown_secs as i64,
+                None => true,
             };
-            let _ = append_record(&hooks_audit_path(), &firing);
-            continue;
+
+            if !cooldown_ok {
+                let firing = HookFiring {
+                    ts: now,
+                    hook_id: hook.id.clone(),
+                    channel: channel.to_string(),
+                    message_id: message_id.to_string(),
+                    condition_result: false,
+                    executed: false,
+                    reason: Some("cooldown active".to_string()),
+                };
+                let _ = append_record(&hooks_audit_path(), &firing);
+                continue;
+            }
         }
 
-        // Handle condition evaluation and claim acquisition
-        // For ClaimAvailable hooks, we do an atomic check-and-stake to prevent races
-        let (claim, claim_ttl, claim_pattern) = match &hook.condition {
-            HookCondition::ClaimAvailable { pattern } => {
-                // Use claim_owner if specified, otherwise use message sender
-                let claim_agent = hook.claim_owner.as_deref().unwrap_or(agent);
-                let pattern_clone = pattern.clone();
-
-                match &hook.claim_release {
-                    Some(ClaimRelease::Ttl { secs }) => {
-                        let ttl = *secs;
-                        let c = FileClaim::new(claim_agent, vec![pattern.clone()], ttl);
-
-                        // Atomic check-and-stake: only append if pattern is still available
-                        let acquired = append_if(&claims_path(), &c, |existing_claims| {
-                            let now = Utc::now();
-                            // Check if pattern is available (properly deduplicates by claim ID)
-                            !is_pattern_held(&pattern_clone, existing_claims, now)
-                        })
-                        .unwrap_or(false);
-
-                        if !acquired {
-                            let firing = HookFiring {
-                                ts: now,
-                                hook_id: hook.id.clone(),
-                                channel: channel.to_string(),
-                                message_id: message_id.to_string(),
-                                condition_result: false,
-                                executed: false,
-                                reason: Some("claim unavailable (atomic check)".to_string()),
-                            };
-                            let _ = append_record(&hooks_audit_path(), &firing);
-                            continue;
-                        }
-
-                        (Some(c), Some(ttl), Some(pattern.clone()))
-                    }
-                    Some(ClaimRelease::OnExit) => {
-                        // Use large sentinel TTL; released explicitly after command exits
-                        let c = FileClaim::new(claim_agent, vec![pattern.clone()], 86400);
-
-                        // Atomic check-and-stake
-                        let acquired = append_if(&claims_path(), &c, |existing_claims| {
-                            let now = Utc::now();
-                            // Check if pattern is available (properly deduplicates by claim ID)
-                            !is_pattern_held(&pattern_clone, existing_claims, now)
-                        })
-                        .unwrap_or(false);
-
-                        if !acquired {
-                            let firing = HookFiring {
-                                ts: now,
-                                hook_id: hook.id.clone(),
-                                channel: channel.to_string(),
-                                message_id: message_id.to_string(),
-                                condition_result: false,
-                                executed: false,
-                                reason: Some("claim unavailable (atomic check)".to_string()),
-                            };
-                            let _ = append_record(&hooks_audit_path(), &firing);
-                            continue;
-                        }
-
-                        (Some(c), None, Some(pattern.clone()))
-                    }
-                    None => {
-                        // No claim release strategy - just check availability without claiming
-                        let condition_result = is_claim_available(pattern).unwrap_or(false);
-                        if !condition_result {
-                            let firing = HookFiring {
-                                ts: now,
-                                hook_id: hook.id.clone(),
-                                channel: channel.to_string(),
-                                message_id: message_id.to_string(),
-                                condition_result: false,
-                                executed: false,
-                                reason: Some("condition not met".to_string()),
-                            };
-                            let _ = append_record(&hooks_audit_path(), &firing);
-                            continue;
-                        }
-                        (None, None, Some(pattern.clone()))
-                    }
-                }
-            }
-            HookCondition::MentionReceived {
-                agent: mention_agent,
-            } => {
-                // Check if agent is mentioned
-                let condition_result = mentions.iter().any(|m| m == mention_agent);
-                if !condition_result {
+        // Take the spawn lease before anything with side effects. Held means
+        // a spawn for this (hook, channel) is still live: batch the trigger
+        // for that spawn's successor rather than dropping or duplicating it.
+        let lease = if hook.uses_lease() {
+            let pattern = hook.lease_pattern(channel);
+            match acquire_lease(&pattern, &command_agent, hook.lease_ttl_secs()) {
+                Some(claim) => Some(claim),
+                None => {
+                    let not_queued =
+                        enqueue_trigger(hook, channel, message_id, agent, body, &command_agent);
+                    let reason = match not_queued {
+                        None => "lease held (queued)".to_string(),
+                        Some(why) => format!("lease held ({})", why),
+                    };
                     let firing = HookFiring {
                         ts: now,
                         hook_id: hook.id.clone(),
@@ -718,99 +1086,109 @@ fn evaluate_hooks_inner(
                         message_id: message_id.to_string(),
                         condition_result: false,
                         executed: false,
-                        reason: Some("condition not met".to_string()),
+                        reason: Some(reason),
                     };
                     let _ = append_record(&hooks_audit_path(), &firing);
                     continue;
                 }
+            }
+        } else {
+            None
+        };
 
-                // If hook has an explicit --claim pattern, acquire it atomically
-                if let (Some(pattern), Some(release)) = (&hook.claim_pattern, &hook.claim_release) {
-                    let claim_agent = hook.claim_owner.as_deref().unwrap_or(agent);
-                    let pattern_clone = pattern.clone();
-
-                    match release {
-                        ClaimRelease::Ttl { secs } => {
-                            let ttl = *secs;
-                            let c = FileClaim::new(claim_agent, vec![pattern.clone()], ttl);
-
-                            let acquired = append_if(&claims_path(), &c, |existing_claims| {
-                                let now = Utc::now();
-                                !is_pattern_held(&pattern_clone, existing_claims, now)
-                            })
-                            .unwrap_or(false);
-
-                            if !acquired {
-                                let firing = HookFiring {
-                                    ts: now,
-                                    hook_id: hook.id.clone(),
-                                    channel: channel.to_string(),
-                                    message_id: message_id.to_string(),
-                                    condition_result: true,
-                                    executed: false,
-                                    reason: Some("claim unavailable".to_string()),
-                                };
-                                let _ = append_record(&hooks_audit_path(), &firing);
-                                continue;
-                            }
-
-                            (Some(c), Some(ttl), Some(pattern.clone()))
-                        }
-                        ClaimRelease::OnExit => {
-                            let c = FileClaim::new(claim_agent, vec![pattern.clone()], 86400);
-
-                            let acquired = append_if(&claims_path(), &c, |existing_claims| {
-                                let now = Utc::now();
-                                !is_pattern_held(&pattern_clone, existing_claims, now)
-                            })
-                            .unwrap_or(false);
-
-                            if !acquired {
-                                let firing = HookFiring {
-                                    ts: now,
-                                    hook_id: hook.id.clone(),
-                                    channel: channel.to_string(),
-                                    message_id: message_id.to_string(),
-                                    condition_result: true,
-                                    executed: false,
-                                    reason: Some("claim unavailable".to_string()),
-                                };
-                                let _ = append_record(&hooks_audit_path(), &firing);
-                                continue;
-                            }
-
-                            (Some(c), None, Some(pattern.clone()))
-                        }
+        // Condition + the hook's own claim. Unchanged semantics; the lease
+        // above is what decides whether a *spawn* may start at all.
+        let (claim, claim_ttl, claim_pattern) = match evaluate_gate(hook, agent, mentions) {
+            HookGate::Ready {
+                claim,
+                claim_ttl,
+                claim_pattern,
+            } => (claim, claim_ttl, claim_pattern),
+            HookGate::ConditionFailed => {
+                release_own_claim(lease.as_ref());
+                let firing = HookFiring {
+                    ts: now,
+                    hook_id: hook.id.clone(),
+                    channel: channel.to_string(),
+                    message_id: message_id.to_string(),
+                    condition_result: false,
+                    executed: false,
+                    reason: Some("condition not met".to_string()),
+                };
+                let _ = append_record(&hooks_audit_path(), &firing);
+                continue;
+            }
+            HookGate::Busy {
+                reason,
+                condition_result,
+            } => {
+                // An instance of this hook is already working. Give the lease
+                // straight back — it is the *claim* that is busy — and, for a
+                // lease-enabled hook, keep the trigger for the next spawn
+                // instead of dropping it the way a cooldown would.
+                release_own_claim(lease.as_ref());
+                let reason = if hook.uses_lease() {
+                    match enqueue_trigger(hook, channel, message_id, agent, body, &command_agent) {
+                        None => format!("{} (queued)", reason),
+                        Some(why) => format!("{} ({})", reason, why),
                     }
                 } else {
-                    // No claim — just fire on mention
-                    (None, None, None)
-                }
+                    reason.to_string()
+                };
+                let firing = HookFiring {
+                    ts: now,
+                    hook_id: hook.id.clone(),
+                    channel: channel.to_string(),
+                    message_id: message_id.to_string(),
+                    condition_result,
+                    executed: false,
+                    reason: Some(reason),
+                };
+                let _ = append_record(&hooks_audit_path(), &firing);
+                continue;
             }
         };
 
         let is_on_exit = matches!(hook.claim_release, Some(ClaimRelease::OnExit));
         let cmd_display = shell_display(&hook.command);
 
+        // Everything that queued up behind the previous spawn goes to this
+        // one, deduplicated against itself and against the message that
+        // triggered it. Marked delivered only if the spawn actually starts.
+        let batch = if hook.uses_lease() {
+            drain_batch(hook, channel, &dedup_key(agent, body))
+        } else {
+            Vec::new()
+        };
+
         // Spawn the command
         let executed = if hook.command.is_empty() {
-            if let Some(c) = &claim {
-                let _ = append_record(&claims_path(), &c.release());
-            }
+            release_own_claim(claim.as_ref());
+            release_own_claim(lease.as_ref());
             false
         } else {
             let mut command = std::process::Command::new(&hook.command[0]);
-            let command_agent = hook_command_agent(hook, agent);
             command
                 .args(&hook.command[1..])
                 .current_dir(&hook.cwd)
                 .env("RITE_CHANNEL", channel)
                 .env("RITE_MESSAGE_ID", message_id)
-                .env("RITE_AGENT", command_agent)
+                .env("RITE_AGENT", &command_agent)
                 .env("RITE_HOOK_ID", &hook.id)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
+
+            if hook.uses_lease() {
+                // Chronological, triggering message last. Additive: hooks
+                // without a lease see exactly the environment they always did.
+                let mut ids: Vec<&str> = batch.iter().map(|e| e.message_id.as_str()).collect();
+                ids.push(message_id);
+                command
+                    .env("RITE_BATCH_COUNT", ids.len().to_string())
+                    .env("RITE_BATCH_MESSAGE_IDS", ids.join(","))
+                    .env("RITE_LEASE_PATTERN", hook.lease_pattern(channel));
+            }
 
             if let Some(traceparent) = crate::telemetry::current_traceparent() {
                 command.env("TRACEPARENT", traceparent);
@@ -818,12 +1196,14 @@ fn evaluate_hooks_inner(
 
             match command.spawn() {
                 Ok(mut child) => {
+                    mark_delivered(&batch);
                     if is_on_exit {
-                        // Block until command exits, then release claim
+                        // Block until command exits, then release claim and
+                        // lease — the next message drains whatever queued up
+                        // while this spawn was running.
                         let _ = child.wait();
-                        if let Some(c) = &claim {
-                            let _ = append_record(&claims_path(), &c.release());
-                        }
+                        release_own_claim(claim.as_ref());
+                        release_own_claim(lease.as_ref());
                     } else {
                         // Reap child in background to prevent zombie processes
                         std::thread::spawn(move || {
@@ -833,9 +1213,8 @@ fn evaluate_hooks_inner(
                     true
                 }
                 Err(_) => {
-                    if let Some(c) = &claim {
-                        let _ = append_record(&claims_path(), &c.release());
-                    }
+                    release_own_claim(claim.as_ref());
+                    release_own_claim(lease.as_ref());
                     false
                 }
             }
@@ -862,6 +1241,7 @@ fn evaluate_hooks_inner(
                 command_display: cmd_display,
                 claim_pattern,
                 claim_ttl,
+                batch_count: batch.len() + 1,
             });
         }
 
@@ -928,6 +1308,7 @@ mod tests {
                 claim_owner: None,
                 priority: 0,
                 require_flag: None,
+                lease: None,
                 active: true,
                 description: None,
             },
@@ -948,6 +1329,7 @@ mod tests {
                 claim_owner: None,
                 priority: 0,
                 require_flag: None,
+                lease: None,
                 active: false, // Deactivated
                 description: None,
             },
@@ -987,6 +1369,7 @@ mod tests {
             claim_owner: Some("worker-agent".to_string()),
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: None,
         };
@@ -1013,11 +1396,88 @@ mod tests {
             claim_owner: None,
             priority: 0,
             require_flag: None,
+            lease: None,
             active: true,
             description: None,
         };
 
         assert_eq!(hook_command_agent(&hook, "trigger-agent"), "trigger-agent");
+    }
+
+    /// A young lease blocks whatever presence says. A freshly spawned agent
+    /// may not have run a single rite command yet, and its last heartbeat
+    /// could be from a previous life — stealing its lease on that basis would
+    /// double-spawn every single time.
+    #[test]
+    fn test_young_lease_blocks_regardless_of_presence() {
+        let mut claim = FileClaim::new(
+            "agent-that-never-heartbeat",
+            vec!["spawn://hk-abc/rite".to_string()],
+            600,
+        );
+        claim.ts = Utc::now() - chrono::Duration::seconds(PRESENCE_TTL_SECS / 2);
+        assert!(lease_blocks(&claim, Utc::now()));
+    }
+
+    /// Unknown presence is not evidence of a dead agent (bn-12i6), so it must
+    /// not supersede a lease; the lease TTL is the backstop for that case.
+    #[test]
+    fn test_old_lease_with_unknown_presence_still_blocks() {
+        let mut claim = FileClaim::new(
+            "agent-with-no-heartbeat-history-at-all",
+            vec!["spawn://hk-abc/rite".to_string()],
+            600,
+        );
+        claim.ts = Utc::now() - chrono::Duration::seconds(PRESENCE_TTL_SECS * 10);
+        assert!(
+            lease_blocks(&claim, Utc::now()),
+            "unknown presence must never be read as 'holder is gone'"
+        );
+    }
+
+    #[test]
+    fn test_lease_available_ignores_expired_and_released_leases() {
+        let pattern = "spawn://hk-abc/rite";
+        let now = Utc::now();
+
+        let mut expired = FileClaim::new("holder", vec![pattern.to_string()], 600);
+        expired.expires_at = now - chrono::Duration::seconds(1);
+        assert!(
+            lease_available(pattern, std::slice::from_ref(&expired), now),
+            "an expired lease is the TTL backstop doing its job"
+        );
+
+        let live = FileClaim::new("holder", vec![pattern.to_string()], 600);
+        assert!(!lease_available(pattern, std::slice::from_ref(&live), now));
+
+        // Latest record per ID wins, so a release frees the pattern.
+        assert!(lease_available(
+            pattern,
+            &[live.clone(), live.release()],
+            now
+        ));
+
+        // A lease on another channel is a different pattern entirely.
+        assert!(lease_available(
+            "spawn://hk-abc/other",
+            std::slice::from_ref(&live),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_dedup_key_identity() {
+        // Same sender, same body (modulo surrounding whitespace) collapses.
+        assert_eq!(
+            dedup_key("a", "do the thing"),
+            dedup_key("a", "do the thing\n")
+        );
+        // Different sender or different body does not.
+        assert_ne!(
+            dedup_key("a", "do the thing"),
+            dedup_key("b", "do the thing")
+        );
+        assert_ne!(dedup_key("a", "do the thing"), dedup_key("a", "do other"));
     }
 
     #[test]
@@ -1041,6 +1501,7 @@ mod tests {
                 claim_owner: None,
                 priority: 10,
                 require_flag: None,
+                lease: None,
                 active: true,
                 description: None,
             },
@@ -1061,6 +1522,7 @@ mod tests {
                 claim_owner: None,
                 priority: -5,
                 require_flag: None,
+                lease: None,
                 active: true,
                 description: None,
             },
@@ -1081,6 +1543,7 @@ mod tests {
                 claim_owner: None,
                 priority: 0,
                 require_flag: None,
+                lease: None,
                 active: true,
                 description: None,
             },

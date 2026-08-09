@@ -74,6 +74,7 @@ pub fn run_with_attachments(
         super::hooks::evaluate_hooks_with_flags(
             &channel,
             &msg.id.to_string(),
+            &message,
             msg.meta.as_ref(),
             &agent_name,
             &msg.mentions,
@@ -164,6 +165,7 @@ pub fn run(
         super::hooks::evaluate_hooks_with_flags(
             &channel,
             &msg.id.to_string(),
+            &message,
             msg.meta.as_ref(),
             &agent_name,
             &msg.mentions,
@@ -191,6 +193,14 @@ pub fn run(
             result.hook_id.cyan(),
             result.command_display.dimmed()
         );
+        if result.batch_count > 1 {
+            println!(
+                "  {} {} triggers (this message plus {} queued behind the last spawn)",
+                "Batched:".green(),
+                result.batch_count,
+                result.batch_count - 1
+            );
+        }
         if let Some(pattern) = &result.claim_pattern {
             if let Some(ttl) = result.claim_ttl {
                 println!("  {} {} (TTL: {}s)", "Claimed:".green(), pattern, ttl);
