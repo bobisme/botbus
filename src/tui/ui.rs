@@ -6,8 +6,82 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
+use std::collections::HashMap;
+use ulid::Ulid;
+
+use crate::core::message::Message;
+use crate::core::thread::{RootKind, resolve_anchor};
 
 use super::app::{App, Focus};
+
+/// Hard ceiling on visual indentation for a reply chain.
+///
+/// `resolve_anchor` will happily report a depth up to `MAX_THREAD_DEPTH`
+/// (256), which would push content off-screen long before that. Deep chains
+/// still render — they just stop indenting further and say how deep they
+/// really go.
+const MAX_VISUAL_DEPTH: usize = 4;
+
+/// Spaces added per level of reply nesting.
+const REPLY_INDENT_UNIT: usize = 2;
+
+/// Why a reply is (or is not) shown as a clean attachment to its parent.
+///
+/// Mirrors [`RootKind`] but from the renderer's point of view: a badge is
+/// chosen once per message, not once per hop, and "parent not in the loaded
+/// window" is folded in as its own case rather than reported as a generic
+/// resolution failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyBadge {
+    /// The immediate parent is loaded and the chain above it is well formed.
+    Reply,
+    /// The immediate parent is not in the loaded window: scrolled out,
+    /// tombstoned, or not yet synced. Indistinguishable from here, and it
+    /// does not matter for rendering — either way there is nothing to quote.
+    MissingParent,
+    /// An ancestor anchors to itself.
+    SelfReference,
+    /// The chain above revisits a message it already passed.
+    Cycle,
+    /// The chain above is longer than `MAX_THREAD_DEPTH`.
+    DepthLimit,
+}
+
+impl ReplyBadge {
+    /// Classify a reply from its direct parent's availability and the full
+    /// chain's [`RootKind`], read via [`resolve_anchor`].
+    ///
+    /// A message can have a perfectly good direct parent while an ancestor
+    /// further up is the one that is broken; that still gets flagged; it is
+    /// never smoothed into a plain `Reply`.
+    fn classify(direct_parent_present: bool, kind: RootKind) -> Self {
+        if !direct_parent_present {
+            return ReplyBadge::MissingParent;
+        }
+        match kind {
+            RootKind::SelfReference => ReplyBadge::SelfReference,
+            RootKind::Cycle => ReplyBadge::Cycle,
+            RootKind::DepthLimit => ReplyBadge::DepthLimit,
+            RootKind::Root | RootKind::Resolved | RootKind::MissingParent => ReplyBadge::Reply,
+        }
+    }
+
+    /// Badge text appended to the header, and whether it needs the alarming
+    /// color (a genuinely malformed chain) or the quiet one (parent simply
+    /// not on screen right now).
+    fn label(self, depth: usize) -> (String, bool) {
+        match self {
+            ReplyBadge::Reply if depth > MAX_VISUAL_DEPTH => {
+                (format!("  ↩ reply (nested {depth}x)"), false)
+            }
+            ReplyBadge::Reply => ("  ↩ reply".to_string(), false),
+            ReplyBadge::MissingParent => ("  ↩ reply (parent not shown)".to_string(), false),
+            ReplyBadge::SelfReference => ("  ↩ reply (self-reference upstream)".to_string(), true),
+            ReplyBadge::Cycle => ("  ↩ reply (cycle detected)".to_string(), true),
+            ReplyBadge::DepthLimit => ("  ↩ reply (depth limit reached)".to_string(), true),
+        }
+    }
+}
 
 /// Colors matching lazygit style
 const ACTIVE_BORDER: Color = Color::Green;
@@ -385,6 +459,10 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Convert all messages to lines, inserting separator if needed
     let messages = app.messages();
+    // Reply resolution only ever looks inside the currently loaded window: a
+    // parent scrolled out of it is exactly as unavailable to the renderer as
+    // one that was tombstoned or never synced. See `ReplyBadge`.
+    let by_id: HashMap<Ulid, &Message> = messages.iter().map(|m| (m.id, m)).collect();
     let mut lines: Vec<Line> = Vec::new();
 
     let separator_pos = if app.has_separator(&raw_channel_name) {
@@ -407,7 +485,7 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
             lines.push(create_separator_line(inner_width));
         }
 
-        lines.extend(format_message(msg, inner_width));
+        lines.extend(format_message(msg, inner_width, &by_id));
     }
 
     // Total lines is just the count since we pre-wrapped in format_message
@@ -509,7 +587,11 @@ fn create_separator_line(width: usize) -> Line<'static> {
     ])
 }
 
-fn format_message(msg: &crate::core::message::Message, max_width: usize) -> Vec<Line<'static>> {
+fn format_message(
+    msg: &Message,
+    max_width: usize,
+    by_id: &HashMap<Ulid, &Message>,
+) -> Vec<Line<'static>> {
     let local_time: DateTime<Local> = msg.ts.with_timezone(&Local);
     let datetime_str = local_time.format("%Y-%m-%d %H:%M").to_string();
 
@@ -537,22 +619,48 @@ fn format_message(msg: &crate::core::message::Message, max_width: usize) -> Vec<
 
     let agent_color = agent_color(&msg.agent);
 
+    // Every message written before threading existed — and every message
+    // that simply is not a reply — has no `parent_id`. That is the untouched
+    // flat path: no connector, no indent, no badge, byte-for-byte what this
+    // function produced before replies existed.
+    let reply = msg.parent_id().map(|parent_id| {
+        let anchor = resolve_anchor(msg.id, by_id);
+        let direct_parent = by_id.get(&parent_id).copied();
+        let depth = anchor.depth.clamp(1, MAX_VISUAL_DEPTH);
+        let badge = ReplyBadge::classify(direct_parent.is_some(), anchor.kind);
+        (direct_parent, depth, anchor.depth, badge)
+    });
+
+    let (connector_indent, body_indent_extra) = match &reply {
+        Some((_, depth, _, _)) => (
+            REPLY_INDENT_UNIT * depth.saturating_sub(1),
+            REPLY_INDENT_UNIT * depth,
+        ),
+        None => (0, 0),
+    };
+
     let mut result_lines = Vec::new();
 
-    // First line: ● agent [timestamp]
-    let mut header_spans = vec![
-        Span::styled("● ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            msg.agent.clone(),
-            Style::default()
-                .fg(agent_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" [{}]", datetime_str),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
+    // First line: ● agent [timestamp] — or, for a reply, an indented
+    // connector standing in for the bullet.
+    let mut header_spans = if reply.is_some() {
+        vec![
+            Span::raw(" ".repeat(connector_indent)),
+            Span::styled("└─ ", Style::default().fg(Color::DarkGray)),
+        ]
+    } else {
+        vec![Span::styled("● ", Style::default().fg(Color::DarkGray))]
+    };
+    header_spans.push(Span::styled(
+        msg.agent.clone(),
+        Style::default()
+            .fg(agent_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+    header_spans.push(Span::styled(
+        format!(" [{}]", datetime_str),
+        Style::default().fg(Color::DarkGray),
+    ));
 
     // Add labels after timestamp if present
     if !msg.labels.is_empty() {
@@ -584,18 +692,54 @@ fn format_message(msg: &crate::core::message::Message, max_width: usize) -> Vec<
         }
     }
 
+    // Explicit reply affordance: never let a reply look like a top-level
+    // message, and never claim a clean attachment when the chain above it is
+    // missing, cyclic, self-referencing, or over the depth cap.
+    if let Some((_, _, raw_depth, badge)) = &reply {
+        let (text, alarming) = badge.label(*raw_depth);
+        let color = if alarming { Color::Red } else { Color::Cyan };
+        header_spans.push(Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::ITALIC),
+        ));
+    }
+
     result_lines.push(Line::from(header_spans));
+
+    // One-line preview of the parent, so a reply is still legible when the
+    // parent has scrolled out of view. Skipped only when there is no parent
+    // to quote (`ReplyBadge::MissingParent`) — the badge above already says
+    // so.
+    if let Some((Some(parent), _, _, _)) = &reply {
+        let preview_indent = " ".repeat(2 + body_indent_extra);
+        result_lines.push(Line::from(vec![
+            Span::raw(preview_indent),
+            Span::styled(
+                format!("↳ {}: ", parent.agent),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Span::styled(
+                preview_text(&parent.body, 60),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
 
     // Process message body - wrap and add @mention highlighting
     let body_lines: Vec<&str> = msg.body.lines().collect();
+    let body_prefix = " ".repeat(2 + body_indent_extra);
 
     for body_line in body_lines {
-        // Wrap the line, leaving room for 2-space indent + 2-space right padding
-        let wrapped = wrap_text(body_line, max_width.saturating_sub(4));
+        // Wrap the line, leaving room for the indent + 2-space right padding
+        let wrapped = wrap_text(body_line, max_width.saturating_sub(4 + body_indent_extra));
 
         for wrapped_line in wrapped {
             // Highlight @mentions in blue
-            let mut line_spans = vec![Span::raw("  ")];
+            let mut line_spans = vec![Span::raw(body_prefix.clone())];
             line_spans.extend(highlight_mentions(&wrapped_line));
             result_lines.push(Line::from(line_spans));
         }
@@ -605,6 +749,23 @@ fn format_message(msg: &crate::core::message::Message, max_width: usize) -> Vec<
     result_lines.push(Line::from(""));
 
     result_lines
+}
+
+/// First line of a message body, trimmed and truncated to `max_chars` — just
+/// enough to recognize the parent by when quoting it inline.
+fn preview_text(body: &str, max_chars: usize) -> String {
+    let first_line = body.lines().next().unwrap_or("").trim();
+    let char_count = first_line.chars().count();
+
+    if char_count <= max_chars {
+        first_line.to_string()
+    } else {
+        let truncated: String = first_line
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect();
+        format!("{truncated}…")
+    }
 }
 
 fn is_system_message(msg: &crate::core::message::Message) -> bool {
@@ -998,5 +1159,159 @@ mod tests {
         let msg = Message::new("botbox-dev", "general", "hello");
 
         assert!(!is_system_message(&msg));
+    }
+
+    mod reply_rendering {
+        use super::super::{MAX_VISUAL_DEPTH, format_message};
+        use crate::core::message::Message;
+        use std::collections::HashMap;
+        use ulid::Ulid;
+
+        /// Flatten a rendered line's spans into plain text for assertions.
+        fn line_text(line: &ratatui::text::Line) -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        }
+
+        fn render(msg: &Message, by_id: &HashMap<Ulid, &Message>) -> Vec<String> {
+            format_message(msg, 100, by_id)
+                .iter()
+                .map(line_text)
+                .collect()
+        }
+
+        /// The untouched default path: a message with no `reply_to` renders
+        /// exactly as it did before threading existed — plain bullet, no
+        /// connector, no badge, no preview line.
+        #[test]
+        fn flat_message_has_no_reply_decoration() {
+            let msg = Message::new("agent", "general", "hello");
+            let by_id: HashMap<Ulid, &Message> = HashMap::new();
+
+            let lines = render(&msg, &by_id);
+            assert!(lines[0].starts_with("● "), "{:?}", lines);
+            assert!(!lines[0].contains("↩"), "{:?}", lines);
+            assert!(!lines.iter().any(|l| l.contains("↳")), "{:?}", lines);
+        }
+
+        /// A reply whose parent is loaded gets a connector, an explicit
+        /// "reply" affordance, and a one-line quote of the parent — the quote
+        /// is what keeps the reply legible once the parent scrolls away.
+        #[test]
+        fn reply_with_loaded_parent_shows_connector_and_preview() {
+            let parent = Message::new("asker", "general", "who owns review 42?");
+            let reply = Message::new("answerer", "general", "I do").with_reply_to(parent.id);
+            let by_id: HashMap<Ulid, &Message> = [(parent.id, &parent), (reply.id, &reply)]
+                .into_iter()
+                .collect();
+
+            let lines = render(&reply, &by_id);
+            assert!(lines[0].contains("└─"), "{:?}", lines);
+            assert!(lines[0].contains("↩ reply"), "{:?}", lines);
+            assert!(!lines[0].contains("not shown"), "{:?}", lines);
+            assert!(
+                lines[1].contains("asker") && lines[1].contains("who owns review 42?"),
+                "{:?}",
+                lines
+            );
+        }
+
+        /// The parent is not in the loaded window (scrolled off, tombstoned,
+        /// or simply unsynced — indistinguishable from here). The reply must
+        /// still say it is a reply, but it must not fabricate a preview, and
+        /// it must never render as if it were a plain top-level message.
+        #[test]
+        fn reply_with_missing_parent_is_flagged_not_smoothed_over() {
+            let orphan_parent = Ulid::new();
+            let reply = Message::new("agent", "general", "on it").with_reply_to(orphan_parent);
+            let by_id: HashMap<Ulid, &Message> = [(reply.id, &reply)].into_iter().collect();
+
+            let lines = render(&reply, &by_id);
+            assert!(lines[0].contains("└─"), "{:?}", lines);
+            assert!(lines[0].contains("parent not shown"), "{:?}", lines);
+            // No preview line: nothing to quote. The body must follow
+            // directly after the header.
+            assert!(!lines[1].contains("↳"), "{:?}", lines);
+        }
+
+        /// A tombstoned parent is removed from the loaded set exactly like
+        /// one that never synced — same degrade path, same badge.
+        #[test]
+        fn reply_to_a_tombstoned_parent_degrades_like_a_missing_one() {
+            let tombstoned_id = Ulid::new();
+            let reply = Message::new("agent", "general", "thanks").with_reply_to(tombstoned_id);
+            // The tombstoned message and its tombstone record are both
+            // filtered out by `read_messages` before the TUI ever sees them,
+            // so the loaded window simply does not contain `tombstoned_id`.
+            let by_id: HashMap<Ulid, &Message> = [(reply.id, &reply)].into_iter().collect();
+
+            let lines = render(&reply, &by_id);
+            assert!(lines[0].contains("parent not shown"), "{:?}", lines);
+        }
+
+        /// Deep chains stop indenting at `MAX_VISUAL_DEPTH` rather than
+        /// pushing content off-screen, but the badge still says how deep the
+        /// chain really goes.
+        #[test]
+        fn deep_chain_caps_visual_indent_but_reports_true_depth() {
+            let mut messages = vec![Message::new("agent", "general", "root")];
+            for i in 0..(MAX_VISUAL_DEPTH + 3) {
+                let parent = messages.last().unwrap().clone();
+                messages.push(
+                    Message::new("agent", "general", format!("hop {i}")).with_reply_to(parent.id),
+                );
+            }
+            let by_id: HashMap<Ulid, &Message> = messages.iter().map(|m| (m.id, m)).collect();
+
+            let at_cap = &messages[MAX_VISUAL_DEPTH];
+            let past_cap = messages.last().unwrap();
+
+            let at_cap_lines = render(at_cap, &by_id);
+            let past_cap_lines = render(past_cap, &by_id);
+
+            // Indentation (everything before the connector glyph) stops
+            // growing once the cap is reached.
+            let indent_of = |line: &str| line.find('└').unwrap_or(0);
+            assert_eq!(
+                indent_of(&at_cap_lines[0]),
+                indent_of(&past_cap_lines[0]),
+                "indent must not grow past the cap: {:?} vs {:?}",
+                at_cap_lines[0],
+                past_cap_lines[0]
+            );
+
+            // But the badge on the deeper message still names its real depth.
+            assert!(!at_cap_lines[0].contains("nested"), "{:?}", at_cap_lines);
+            assert!(past_cap_lines[0].contains("nested"), "{:?}", past_cap_lines);
+        }
+
+        /// An ancestor that anchors to itself is surfaced, not smoothed into
+        /// a plain reply badge.
+        #[test]
+        fn self_reference_upstream_is_surfaced() {
+            let mut looped = Message::new("agent", "general", "me");
+            looped.reply_to = Some(looped.id);
+            let child = Message::new("agent", "general", "child").with_reply_to(looped.id);
+            let by_id: HashMap<Ulid, &Message> = [(looped.id, &looped), (child.id, &child)]
+                .into_iter()
+                .collect();
+
+            let lines = render(&child, &by_id);
+            assert!(lines[0].contains("self-reference"), "{:?}", lines);
+        }
+
+        /// Two messages anchored to each other form a cycle; the walk
+        /// terminates and the reply badge says so instead of pretending the
+        /// chain is clean.
+        #[test]
+        fn cycle_upstream_is_surfaced() {
+            let mut a = Message::new("agent", "general", "a");
+            let mut b = Message::new("agent", "general", "b");
+            a.reply_to = Some(b.id);
+            b.reply_to = Some(a.id);
+            let by_id: HashMap<Ulid, &Message> = [(a.id, &a), (b.id, &b)].into_iter().collect();
+
+            let lines = render(&a, &by_id);
+            assert!(lines[0].contains("cycle detected"), "{:?}", lines);
+        }
     }
 }
