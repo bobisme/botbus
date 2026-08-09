@@ -100,14 +100,24 @@ fn main() -> Result<()> {
             meta,
             labels,
             attachments,
+            reply_to,
             no_hooks,
+            format: local_format,
         } => cli::send::run(
-            target,
-            message,
-            meta,
-            labels,
-            attachments,
-            no_hooks,
+            cli::send::SendOptions {
+                target,
+                message,
+                meta,
+                labels,
+                attachments,
+                reply_to,
+                no_hooks,
+                format: if cli.json {
+                    OutputFormat::Json
+                } else {
+                    local_format.unwrap_or(format)
+                },
+            },
             cli.agent.as_deref(),
         ),
 
@@ -124,6 +134,7 @@ fn main() -> Result<()> {
             labels,
             after_offset,
             after_id,
+            thread,
             show_offset,
             format: local_format,
         } => cli::history::run(cli::history::HistoryOptions {
@@ -138,6 +149,7 @@ fn main() -> Result<()> {
             labels,
             after_offset,
             after_id,
+            thread,
             show_offset,
             // Use local format if provided, otherwise default to Text for history
             format: if cli.json {

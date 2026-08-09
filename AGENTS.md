@@ -39,8 +39,8 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 
 | Command | Usage |
 |---------|-------|
-| `send` | `rite send <target> <message> [-L label] [--attach file] [--no-hooks]` |
-| `history` | `rite history [channel] [-n count] [-f] [--since/--before] [--from] [-L label]` |
+| `send` | `rite send <target> <message> [-L label] [--attach file] [--reply-to id] [--no-hooks]` |
+| `history` | `rite history [channel] [-n count] [-f] [--since/--before] [--from] [-L label] [--thread id]` |
 | `inbox` | `rite inbox [-c channels] [--all] [--mentions] [-n count] [--mark-read] [--count-only]` |
 | `mark-read` | `rite mark-read <channel>` |
 | `search` | `rite search <query> [-c channel] [-n count] [--from]` |
@@ -92,6 +92,41 @@ rite send general "named" --attach "label:./path/to/file"
 ```
 
 Files are stored in a content-addressed cache (SHA256). The Telegram bridge relays attachments bidirectionally.
+
+### Threads
+
+Several agents in one channel produce an interleaved transcript. Anchor a
+message to the one it answers so a reader can tell what answers what.
+
+```bash
+# The id of the message you just sent, for machines
+rite send rite "Review requested: rv-12 @rite-security" --format json
+# → {"id":"01K2...","channel":"rite", ...}
+
+# Answer a specific message
+rite send rite "Reviewing rv-12 now" --reply-to 01K2...
+
+# Inside a hook, the triggering message is already in the environment
+rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
+
+# Read the whole conversation, from any message in it
+rite history --thread 01K2...
+```
+
+Rules:
+
+- No `--reply-to` means top-level. That is the default and every message
+  written before threading existed.
+- `--reply-to` accepts an id that has not synced here yet. You get a warning,
+  not an error.
+- `--thread` finds the channel from the id, so you do not have to name one.
+- A thread whose parent is missing or deleted comes back as a fragment, marked
+  `complete: false` with `missing_parent` set. It is never presented as a whole
+  conversation.
+- An anchor this build cannot read is dropped so the message survives, and the
+  drop is reported: once on stderr per file, and counted by `rite doctor` as
+  `damaged_field_count`. A reply that quietly became top-level is how an
+  acknowledgment stops correlating, so it is never silent.
 
 ### Message Flags
 

@@ -117,9 +117,24 @@ pub enum Commands {
         #[arg(long = "attach", action = clap::ArgAction::Append)]
         attachments: Vec<String>,
 
+        /// Anchor this message as a reply to <ID> (ULID)
+        ///
+        /// Inside a hook the triggering message is in $RITE_MESSAGE_ID, so a
+        /// spawned agent can answer the message that woke it:
+        ///   rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
+        ///
+        /// The anchor does not have to be present locally yet — a parent still
+        /// syncing from another machine produces a warning, not an error.
+        #[arg(long = "reply-to", value_name = "ID")]
+        reply_to: Option<String>,
+
         /// Don't fire hooks for this message
         #[arg(long)]
         no_hooks: bool,
+
+        /// Output format (json prints the new message id for scripting)
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
     },
 
     /// View message history
@@ -171,6 +186,22 @@ pub enum Commands {
         /// Read messages after this message ID (ULID)
         #[arg(long)]
         after_id: Option<String>,
+
+        /// Show the whole thread containing <ID> (ULID)
+        ///
+        /// Walks up to the thread root, then returns the root and every reply
+        /// under it in creation order. Works with the message id alone: if the
+        /// id is not in the named channel, every channel is searched.
+        ///
+        /// A thread whose root answers a message that has not synced yet is
+        /// returned as a fragment and reported as one, never as a whole
+        /// conversation.
+        #[arg(
+            long,
+            value_name = "ID",
+            conflicts_with_all = ["after_offset", "after_id", "follow"]
+        )]
+        thread: Option<String>,
 
         /// Show offset info for next read
         #[arg(long)]

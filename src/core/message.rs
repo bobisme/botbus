@@ -32,6 +32,36 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
 
+    /// The message this one answers, if any.
+    ///
+    /// Absent means top-level. That is every message written before this field
+    /// existed and every message that is not a reply, so the flat transcript
+    /// stays the untouched default path.
+    ///
+    /// # Wire format
+    ///
+    /// The field is skipped when `None`, so a non-reply is byte-identical on
+    /// the wire to a record written by a build that never heard of threading.
+    /// An older rite ignores the extra key like any unknown field (`Message`
+    /// does not deny unknown fields), so it reads a reply as a plain message.
+    ///
+    /// A value this build cannot read degrades to `None` rather than failing
+    /// the parse. This is deliberate and it is *not* the tagged-enum policy in
+    /// [`crate::core::wire`]: an anchor is a pointer, not payload. Dropping an
+    /// unreadable pointer costs one message's thread position; rejecting the
+    /// record would cost the message itself, in every reader, for good. Losing
+    /// the anchor lands the message exactly where it would have been before
+    /// threading existed.
+    ///
+    /// The drop is counted and reported — see [`deserialize_reply_to`]. It is
+    /// degradation, not silence.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_reply_to",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reply_to: Option<Ulid>,
+
     /// Optional file attachments
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -59,6 +89,7 @@ impl Message {
             body,
             mentions,
             labels: Vec::new(),
+            reply_to: None,
             attachments: Vec::new(),
             meta: None,
         }
@@ -68,6 +99,29 @@ impl Message {
     pub fn with_meta(mut self, meta: MessageMeta) -> Self {
         self.meta = Some(meta);
         self
+    }
+
+    /// Anchor this message to the message it answers.
+    pub fn with_reply_to(mut self, parent: Ulid) -> Self {
+        self.reply_to = Some(parent);
+        self
+    }
+
+    /// True when this message carries a reply anchor.
+    pub fn is_reply(&self) -> bool {
+        self.parent_id().is_some()
+    }
+
+    /// The parent this message answers, with self-reference removed.
+    ///
+    /// A message that points at itself has no parent. Use this instead of
+    /// reading `reply_to` directly wherever the value feeds a walk, an index
+    /// row, or a children map — a self-edge there loops forever.
+    pub fn parent_id(&self) -> Option<Ulid> {
+        match self.reply_to {
+            Some(parent) if parent == self.id => None,
+            other => other,
+        }
     }
 
     /// Add labels to the message.
@@ -92,6 +146,54 @@ impl Message {
         labels.iter().any(|l| self.has_label(l))
     }
 }
+
+/// Read `reply_to` without ever failing the record.
+///
+/// A ULID string becomes the anchor. Anything else — a shape a newer rite gave
+/// the field, a value mangled by a bad merge — is dropped so the message still
+/// reads as top-level instead of vanishing from the channel. See the field docs
+/// on [`Message::reply_to`] for why this differs from the tagged-enum policy in
+/// [`crate::core::wire`].
+///
+/// Dropping is never silent. Each loss is handed to
+/// [`crate::storage::jsonl::report_damaged_field`], which surfaces it the same
+/// way an unreadable line is surfaced: one deduped stderr note per file per
+/// process, and a count in `rite doctor`. That matters more than the usual
+/// tidiness argument: a dropped anchor demotes a reply to a top-level message,
+/// so an acknowledgment stops correlating with the request it answers, a
+/// waiter times out, and the requester re-posts. Losing anchors quietly
+/// recreates the duplicate-request problem threading exists to remove.
+fn deserialize_reply_to<'de, D>(deserializer: D) -> Result<Option<Ulid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+
+    Ok(match raw {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => match text.parse::<Ulid>() {
+            Ok(parent) => Some(parent),
+            Err(_) => {
+                crate::storage::jsonl::report_damaged_field(
+                    REPLY_TO_FIELD,
+                    format!("{:?} (not a ULID)", text),
+                );
+                None
+            }
+        },
+        Some(other) => {
+            crate::storage::jsonl::report_damaged_field(
+                REPLY_TO_FIELD,
+                format!("{} (not a ULID string)", other),
+            );
+            None
+        }
+    })
+}
+
+/// Name reported for a dropped reply anchor. Shared so a test cannot drift
+/// from what the reader actually emits.
+pub const REPLY_TO_FIELD: &str = "reply_to";
 
 /// File attachment on a message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,6 +671,163 @@ mod tests {
     }
 
     #[test]
+    fn test_reply_to_round_trips() {
+        let parent = Message::new("asker", "general", "who owns review 42?");
+        let reply = Message::new("answerer", "general", "I do").with_reply_to(parent.id);
+
+        let json = serde_json::to_string(&reply).unwrap();
+        assert!(json.contains("reply_to"));
+
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reply_to, Some(parent.id));
+        assert_eq!(parsed.parent_id(), Some(parent.id));
+        assert!(parsed.is_reply());
+    }
+
+    /// The flat path must be untouched: a message with no anchor writes no
+    /// `reply_to` key, so its bytes match what a pre-threading rite wrote.
+    #[test]
+    fn test_absent_reply_to_is_not_serialized() {
+        let msg = Message::new("agent", "general", "top level");
+        let json = serde_json::to_string(&msg).unwrap();
+
+        assert!(!json.contains("reply_to"), "{}", json);
+        assert!(!msg.is_reply());
+        assert_eq!(msg.parent_id(), None);
+
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reply_to, None);
+    }
+
+    /// Every record ever written lacks the field. Reading one must yield a
+    /// top-level message, not an error.
+    #[test]
+    fn test_record_without_reply_to_reads_as_top_level() {
+        let legacy = r#"{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"old","channel":"general","body":"before threading"}"#;
+
+        let parsed: Message = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.reply_to, None);
+        assert!(!parsed.is_reply());
+    }
+
+    /// An anchor this build cannot read costs the message its thread position,
+    /// never the message. Contrast `test_corrupt_known_meta_is_an_error`: a
+    /// damaged tagged enum still fails loudly.
+    #[test]
+    fn test_unreadable_reply_to_degrades_to_top_level() {
+        for bad in [
+            r#""not-a-ulid""#,
+            r#"{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","channel":"general"}"#,
+            "42",
+            "null",
+        ] {
+            let line = format!(
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"future","channel":"general","body":"hello","reply_to":{}}}"#,
+                bad
+            );
+            let parsed: Message = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("reply_to {bad} must not fail the record: {e}"));
+            assert_eq!(parsed.reply_to, None, "reply_to {bad}");
+            assert_eq!(parsed.body, "hello");
+        }
+    }
+
+    /// A reply must also survive the fields a newer rite may add next to it.
+    #[test]
+    fn test_reply_to_coexists_with_unknown_fields() {
+        let line = r#"{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FBW","agent":"future","channel":"general","body":"answer","reply_to":"01ARZ3NDEKTSV4RRFFQ69G5FAV","thread_root":"01ARZ3NDEKTSV4RRFFQ69G5FAV","priority":"high"}"#;
+
+        let parsed: Message = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            parsed.reply_to,
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<Ulid>().unwrap())
+        );
+    }
+
+    /// A message pointing at itself has no parent. Anything that walks or
+    /// indexes anchors must see `None`, or it loops.
+    #[test]
+    fn test_self_reference_is_not_a_parent() {
+        let mut msg = Message::new("agent", "general", "me");
+        msg.reply_to = Some(msg.id);
+
+        assert_eq!(msg.parent_id(), None);
+        assert!(!msg.is_reply());
+        // The raw value is preserved so a diagnostic can still show it.
+        assert_eq!(msg.reply_to, Some(msg.id));
+    }
+
+    /// A reply in a channel file must not disturb its neighbours, and a
+    /// neighbour with a damaged anchor must not take the channel down.
+    #[test]
+    fn test_replies_and_damaged_anchors_share_a_channel() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("channel.jsonl");
+
+        let parent = Message::new("asker", "channel", "question");
+        let reply = Message::new("answerer", "channel", "answer").with_reply_to(parent.id);
+        crate::storage::jsonl::append_record(&path, &parent).unwrap();
+        crate::storage::jsonl::append_record(&path, &reply).unwrap();
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"mangled","channel":"channel","body":"bad anchor","reply_to":"????"}}"#
+            )
+            .unwrap();
+        }
+
+        let (messages, issues) =
+            crate::storage::jsonl::read_records_reporting::<Message>(&path).unwrap();
+
+        assert!(
+            issues.skipped.is_empty(),
+            "no record may be treated as corrupt"
+        );
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].reply_to, Some(parent.id));
+        assert_eq!(messages[2].reply_to, None);
+
+        // The dropped anchor is *counted*, not merely absent. A reply that
+        // quietly becomes top-level is how an acknowledgment stops
+        // correlating; the read has to say it happened.
+        assert_eq!(issues.damaged.len(), 1);
+        let damaged = &issues.damaged[0];
+        assert_eq!(damaged.field, REPLY_TO_FIELD);
+        assert_eq!(damaged.line, Some(3));
+        assert_eq!(damaged.path, path);
+        assert!(damaged.value.contains("????"), "{}", damaged.value);
+        assert!(damaged.to_string().contains("reply_to"));
+    }
+
+    /// A run of clean reads must not leave stale damage behind for the next
+    /// one to claim as its own.
+    #[test]
+    fn test_a_clean_channel_reports_no_damage() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("channel.jsonl");
+
+        let parent = Message::new("asker", "channel", "question");
+        let reply = Message::new("answerer", "channel", "answer").with_reply_to(parent.id);
+        crate::storage::jsonl::append_record(&path, &parent).unwrap();
+        crate::storage::jsonl::append_record(&path, &reply).unwrap();
+
+        let (messages, issues) =
+            crate::storage::jsonl::read_records_reporting::<Message>(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(issues.is_empty(), "{:?}", issues);
+    }
+
+    #[test]
     fn test_extract_mentions() {
         assert_eq!(
             extract_mentions("Hello @Alice and @Bob"),
@@ -993,8 +1252,9 @@ mod tests {
             .unwrap();
         }
 
-        let (messages, skipped) =
+        let (messages, issues) =
             crate::storage::jsonl::read_records_reporting::<Message>(&path).unwrap();
+        let skipped = &issues.skipped;
 
         assert_eq!(messages.len(), 2, "the future record must survive");
         assert_eq!(messages[1].body, "future");

@@ -132,6 +132,7 @@ pub fn run(options: InboxOptions, explicit_agent: Option<&str>) -> Result<()> {
             labels: vec![],
             after_offset,
             after_id,
+            thread: None,
             show_offset: false,
             format: OutputFormat::Text,
             agent: Some(agent.clone()),

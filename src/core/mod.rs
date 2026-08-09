@@ -9,6 +9,7 @@ pub mod names;
 pub mod presence;
 pub mod project;
 pub mod status;
+pub mod thread;
 pub mod wire;
 
 pub use agent::{Agent, AgentEvent};
@@ -17,3 +18,4 @@ pub use flags::{HookFlags, parse_flags};
 pub use hook::{Hook, HookCondition, HookFiring};
 pub use identity::{AGENT_ENV_VAR, require_agent, resolve_agent};
 pub use message::{Message, MessageMeta, SystemEvent};
+pub use thread::{Anchor, RootKind, Thread, collect_thread, resolve_anchor};

@@ -2,8 +2,11 @@
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use serde::Serialize;
 use tracing::instrument;
+use ulid::Ulid;
 
+use super::OutputFormat;
 use crate::attachments::{AttachmentCache, AttachmentSource, attachments_dir};
 use crate::core::channel::{dm_channel_name, is_valid_channel_name};
 use crate::core::flags::parse_flags;
@@ -13,9 +16,72 @@ use crate::core::project::{channel_path, data_dir};
 use crate::storage::jsonl::append_record;
 use crate::sync::auto_commit::auto_commit_after_send;
 
+/// Everything `rite send` needs.
+pub struct SendOptions {
+    /// Channel name, or `@agent` for a DM
+    pub target: String,
+    /// Message body
+    pub message: String,
+    /// Reserved: structured metadata passed as JSON (not yet wired up)
+    pub meta: Option<String>,
+    pub labels: Vec<String>,
+    /// Attachment specs (`path`, `name:path`, or `url:...`)
+    pub attachments: Vec<String>,
+    /// The message this one answers
+    pub reply_to: Option<String>,
+    pub no_hooks: bool,
+    pub format: OutputFormat,
+}
+
+impl SendOptions {
+    /// Minimal send: a body, a target, nothing else.
+    pub fn new(target: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            message: message.into(),
+            meta: None,
+            labels: Vec::new(),
+            attachments: Vec::new(),
+            reply_to: None,
+            no_hooks: false,
+            format: OutputFormat::Pretty,
+        }
+    }
+}
+
+/// What a send produced.
+///
+/// `id` is the point of this type. An agent that sends a question needs the id
+/// back to wait on an answer to *that* message (`rite wait --reply-to <id>`),
+/// and it cannot get it by reading the channel: another agent's message may
+/// have landed in between.
+#[derive(Debug, Serialize)]
+pub struct SendOutput {
+    /// ULID of the message just written.
+    pub id: String,
+    /// Resolved channel (a DM target becomes its `_dm_…` channel).
+    pub channel: String,
+    pub agent: String,
+    /// RFC3339 creation time.
+    pub ts: String,
+    /// The message this one answers, when `--reply-to` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// Hooks that fired for this message.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<String>,
+    /// Non-fatal problems, e.g. a reply anchor that is not in the channel yet.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advice: Vec<String>,
+}
+
 /// Simple message send (no labels or attachments) - for internal use and tests.
 pub fn run_simple(target: String, message: String, agent: Option<&str>) -> Result<()> {
-    run(target, message, None, vec![], vec![], false, agent)
+    run(SendOptions::new(target, message), agent)
 }
 
 /// Send a message with pre-parsed Attachment structs (for Telegram bridge).
@@ -86,16 +152,19 @@ pub fn run_with_attachments(
 }
 
 /// Send a message to a channel or agent.
-#[instrument(skip(message, _meta, labels, attachments), fields(target = %target, no_hooks))]
-pub fn run(
-    target: String,
-    message: String,
-    _meta: Option<String>,
-    labels: Vec<String>,
-    attachments: Vec<String>,
-    no_hooks: bool,
-    agent: Option<&str>,
-) -> Result<()> {
+#[instrument(skip(options), fields(target = %options.target, no_hooks = options.no_hooks))]
+pub fn run(options: SendOptions, agent: Option<&str>) -> Result<()> {
+    let SendOptions {
+        target,
+        message,
+        meta: _meta,
+        labels,
+        attachments,
+        reply_to,
+        no_hooks,
+        format,
+    } = options;
+
     // Get current agent from env var or explicit flag
     let agent_name = require_agent(agent)?;
 
@@ -139,18 +208,57 @@ pub fn run(
     // Parse attachments (format: "name:path", "path", or "url:https://...")
     let parsed_attachments = parse_attachments_for_channel(&attachments, &channel, &agent_name)?;
 
+    let path = channel_path(&channel);
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Resolve the reply anchor before writing anything. A malformed id is a
+    // caller error and fails loudly; an id that is simply not here yet is not,
+    // because the parent may still be in transit from another machine.
+    let parent = match &reply_to {
+        Some(raw) => {
+            let parent: Ulid = raw.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid --reply-to message ID: '{}'\n\n\
+                     Expected a ULID, as printed by `rite send --format json` \
+                     or carried in $RITE_MESSAGE_ID inside a hook.",
+                    raw
+                )
+            })?;
+
+            if crate::core::message::offset_after_message_id(&path, &parent.to_string())?.is_none()
+            {
+                warnings.push(format!(
+                    "reply anchor {} is not in #{} yet; the reply is recorded and links up once the parent arrives",
+                    parent, channel
+                ));
+            }
+
+            Some(parent)
+        }
+        None => None,
+    };
+
     // Store original body — flags are meaningful to downstream consumers
     let mut msg = Message::new(&agent_name, &channel, &message);
 
     if !labels.is_empty() {
-        msg = msg.with_labels(labels);
+        msg = msg.with_labels(labels.clone());
+    }
+
+    if let Some(parent) = parent {
+        // A fresh ULID cannot equal an existing one, so this is unreachable in
+        // practice. It is still checked, because the one thing a reply anchor
+        // must never be is a self-edge.
+        if parent == msg.id {
+            bail!("A message cannot reply to itself.");
+        }
+        msg = msg.with_reply_to(parent);
     }
 
     if !parsed_attachments.is_empty() {
         msg = msg.with_attachments(parsed_attachments);
     }
 
-    let path = channel_path(&channel);
     append_record(&path, &msg)
         .with_context(|| format!("Failed to send message to #{}", channel))?;
 
@@ -173,48 +281,93 @@ pub fn run(
         )
     };
 
-    // Output confirmation
-    if target.starts_with('@') {
-        println!("{} Message sent to {}", "Sent:".green(), target.cyan());
-        // Tip for DMs - mention the wait command
-        println!(
-            "{}",
-            format!("Tip: rite wait -c {} -t 60 to wait for reply", target).dimmed()
-        );
-    } else {
-        println!("{} Message sent to #{}", "Sent:".green(), channel.cyan());
-    }
+    let output = SendOutput {
+        id: msg.id.to_string(),
+        channel: channel.clone(),
+        agent: agent_name.clone(),
+        ts: msg.ts.to_rfc3339(),
+        reply_to: msg.reply_to.map(|p| p.to_string()),
+        labels,
+        hooks: hook_results.iter().map(|r| r.hook_id.clone()).collect(),
+        warnings,
+        // Only commands that exist today. `rite wait --reply-to` is the
+        // natural next step and is tracked separately (bn-3lpb); it is not
+        // advertised until it works.
+        advice: vec![format!("rite history --thread {}", msg.id)],
+    };
 
-    // Show hook results
-    for result in &hook_results {
-        println!(
-            "{} Hook {} fired: {}",
-            "⚡".dimmed(),
-            result.hook_id.cyan(),
-            result.command_display.dimmed()
-        );
-        if result.batch_count > 1 {
-            println!(
-                "  {} {} triggers (this message plus {} queued behind the last spawn)",
-                "Batched:".green(),
-                result.batch_count,
-                result.batch_count - 1
-            );
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
-        if let Some(pattern) = &result.claim_pattern {
-            if let Some(ttl) = result.claim_ttl {
-                println!("  {} {} (TTL: {}s)", "Claimed:".green(), pattern, ttl);
+        OutputFormat::Text => {
+            // TOON: one field per line. `id` comes first because it is the
+            // handle a caller needs for --reply-to and `rite wait`.
+            println!("id: {}", output.id);
+            println!("channel: {}", output.channel);
+            if let Some(parent) = &output.reply_to {
+                println!("reply_to: {}", parent);
+            }
+            for hook in &output.hooks {
+                println!("hook: {}", hook);
+            }
+            for warning in &output.warnings {
+                println!("warning: {}", warning);
+            }
+        }
+        OutputFormat::Pretty => {
+            if target.starts_with('@') {
+                println!("{} Message sent to {}", "Sent:".green(), target.cyan());
             } else {
+                println!("{} Message sent to #{}", "Sent:".green(), channel.cyan());
+            }
+            println!("{} {}", "id:".dimmed(), output.id.dimmed());
+            if let Some(parent) = &output.reply_to {
+                println!("{} {}", "reply to:".dimmed(), parent.dimmed());
+            }
+            for warning in &output.warnings {
+                println!("{} {}", "Warning:".yellow(), warning);
+            }
+            if target.starts_with('@') {
+                // Tip for DMs - mention the wait command
                 println!(
-                    "  {} {} (released on command exit)",
-                    "Claimed:".green(),
-                    pattern
+                    "{}",
+                    format!("Tip: rite wait -c {} -t 60 to wait for reply", target).dimmed()
                 );
             }
-            println!(
-                "  {}",
-                format!("Release: rite release {}", pattern).dimmed()
-            );
+
+            // Show hook results
+            for result in &hook_results {
+                println!(
+                    "{} Hook {} fired: {}",
+                    "⚡".dimmed(),
+                    result.hook_id.cyan(),
+                    result.command_display.dimmed()
+                );
+                if result.batch_count > 1 {
+                    println!(
+                        "  {} {} triggers (this message plus {} queued behind the last spawn)",
+                        "Batched:".green(),
+                        result.batch_count,
+                        result.batch_count - 1
+                    );
+                }
+                if let Some(pattern) = &result.claim_pattern {
+                    if let Some(ttl) = result.claim_ttl {
+                        println!("  {} {} (TTL: {}s)", "Claimed:".green(), pattern, ttl);
+                    } else {
+                        println!(
+                            "  {} {} (released on command exit)",
+                            "Claimed:".green(),
+                            pattern
+                        );
+                    }
+                    println!(
+                        "  {}",
+                        format!("Release: rite release {}", pattern).dimmed()
+                    );
+                }
+            }
         }
     }
 
@@ -345,12 +498,7 @@ mod tests {
 
         // Use explicit agent name
         run(
-            "test-general".to_string(),
-            "Hello, world!".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
+            SendOptions::new("test-general", "Hello, world!"),
             Some("test-sender"),
         )
         .unwrap();
@@ -368,12 +516,7 @@ mod tests {
         let _env = TestEnv::new();
 
         run(
-            "@other-agent".to_string(),
-            "Private message".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
+            SendOptions::new("@other-agent", "Private message"),
             Some("test-sender"),
         )
         .unwrap();
@@ -390,15 +533,7 @@ mod tests {
     fn test_send_invalid_channel() {
         let _env = TestEnv::new();
 
-        let result = run(
-            "INVALID".to_string(),
-            "test".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
-            Some("test-sender"),
-        );
+        let result = run(SendOptions::new("INVALID", "test"), Some("test-sender"));
         assert!(result.is_err());
     }
 
@@ -413,15 +548,7 @@ mod tests {
             env::remove_var("AGENT");
         }
 
-        let result = run(
-            "general".to_string(),
-            "test".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
-            None,
-        );
+        let result = run(SendOptions::new("general", "test"), None);
         assert!(result.is_err());
     }
 
@@ -431,12 +558,10 @@ mod tests {
         let _env = TestEnv::new();
 
         run(
-            "test-labeled".to_string(),
-            "Bug fix ready".to_string(),
-            None,
-            vec!["bug".to_string(), "ready".to_string()],
-            vec![],
-            false,
+            SendOptions {
+                labels: vec!["bug".to_string(), "ready".to_string()],
+                ..SendOptions::new("test-labeled", "Bug fix ready")
+            },
             Some("test-sender"),
         )
         .unwrap();
@@ -455,12 +580,10 @@ mod tests {
         std::fs::write(&file_path, "attachment body").unwrap();
 
         run(
-            "#actual-channel".to_string(),
-            "See attached".to_string(),
-            None,
-            vec![],
-            vec![file_path.to_string_lossy().to_string()],
-            false,
+            SendOptions {
+                attachments: vec![file_path.to_string_lossy().to_string()],
+                ..SendOptions::new("#actual-channel", "See attached")
+            },
             Some("test-sender"),
         )
         .unwrap();
@@ -502,12 +625,7 @@ mod tests {
 
         // Try to send to #claims (with # prefix)
         let result = run(
-            "#claims".to_string(),
-            "test message".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
+            SendOptions::new("#claims", "test message"),
             Some("test-sender"),
         );
         assert!(result.is_err());
@@ -515,12 +633,7 @@ mod tests {
 
         // Try without # prefix
         let result = run(
-            "claims".to_string(),
-            "test message".to_string(),
-            None,
-            vec![],
-            vec![],
-            false,
+            SendOptions::new("claims", "test message"),
             Some("test-sender"),
         );
         assert!(result.is_err());

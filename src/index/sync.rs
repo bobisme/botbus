@@ -189,6 +189,186 @@ pub struct SyncStats {
 
 #[cfg(test)]
 mod tests {
-    // Integration tests moved to tests/integration/ since they require
-    // global data directory mocking
+    // Most integration tests moved to tests/integration/ since they require
+    // global data directory mocking. The reply-edge tests below need the same
+    // mocking, and there is nowhere else that can reach `IndexSyncer::rebuild`
+    // and the index in one process.
+
+    use super::*;
+    use crate::core::message::{Message, MessageMeta};
+    use crate::core::project::{DATA_DIR_ENV_VAR, channel_path, ensure_data_dir};
+    use crate::storage::jsonl::append_record;
+    use chrono::Utc;
+    use serial_test::serial;
+    use std::env;
+    use tempfile::TempDir;
+
+    struct TestEnv {
+        _dir: TempDir,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            unsafe {
+                env::set_var(DATA_DIR_ENV_VAR, dir.path());
+            }
+            ensure_data_dir().unwrap();
+            Self { _dir: dir }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            unsafe {
+                env::remove_var(DATA_DIR_ENV_VAR);
+            }
+        }
+    }
+
+    fn write(channel: &str, msg: &Message) {
+        append_record(&channel_path(channel), msg).unwrap();
+    }
+
+    /// The index is derived, so a rebuild has to land on the same reply edges
+    /// the incremental path produced. If it does not, `rite index rebuild`
+    /// becomes a way to lose threads.
+    #[test]
+    #[serial]
+    fn rebuild_reproduces_the_reply_edges_incremental_sync_built() {
+        let _env = TestEnv::new();
+
+        let question = Message::new("alice", "general", "who owns review 42?");
+        let first = Message::new("bob", "general", "I do").with_reply_to(question.id);
+        let second = Message::new("carol", "general", "so do I").with_reply_to(question.id);
+        let nested = Message::new("dave", "general", "thanks").with_reply_to(first.id);
+        let unrelated = Message::new("erin", "general", "different topic");
+        let elsewhere = Message::new("frank", "backend", "deploying").with_reply_to(question.id);
+
+        for msg in [&question, &first, &second, &nested, &unrelated] {
+            write("general", msg);
+        }
+        write("backend", &elsewhere);
+
+        let mut syncer = IndexSyncer::new().unwrap();
+        syncer.sync_all().unwrap();
+
+        let parent = question.id.to_string();
+        let incremental: Vec<String> = syncer
+            .index()
+            .replies_to(&parent)
+            .unwrap()
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect();
+        assert_eq!(incremental.len(), 3, "two here, one from #backend");
+        let incremental_total = syncer.index().reply_edge_count().unwrap();
+        assert_eq!(incremental_total, 4, "only replies take a row");
+
+        syncer.rebuild().unwrap();
+
+        let rebuilt: Vec<String> = syncer
+            .index()
+            .replies_to(&parent)
+            .unwrap()
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect();
+        assert_eq!(rebuilt, incremental, "rebuild must reproduce the edges");
+        assert_eq!(
+            syncer.index().reply_edge_count().unwrap(),
+            incremental_total
+        );
+
+        // The reverse direction survives too.
+        assert_eq!(
+            syncer.index().parent_of(&nested.id.to_string()).unwrap(),
+            Some(first.id.to_string())
+        );
+        assert_eq!(
+            syncer.index().parent_of(&unrelated.id.to_string()).unwrap(),
+            None
+        );
+
+        // And a second rebuild is idempotent, not additive.
+        syncer.rebuild().unwrap();
+        assert_eq!(
+            syncer.index().reply_edge_count().unwrap(),
+            incremental_total
+        );
+    }
+
+    /// A rebuild reads through `read_messages`, which drops tombstoned
+    /// records. The deleted message must take its own edge with it, and leave
+    /// its children's edges alone so they stay dangling rather than promoted.
+    #[test]
+    #[serial]
+    fn rebuild_drops_edges_for_deleted_messages() {
+        let _env = TestEnv::new();
+
+        let question = Message::new("alice", "general", "question");
+        let answer = Message::new("bob", "general", "answer").with_reply_to(question.id);
+        let nested = Message::new("carol", "general", "follow-up").with_reply_to(answer.id);
+        for msg in [&question, &answer, &nested] {
+            write("general", msg);
+        }
+
+        let mut syncer = IndexSyncer::new().unwrap();
+        syncer.sync_all().unwrap();
+        assert_eq!(syncer.index().reply_edge_count().unwrap(), 2);
+
+        // Tombstone the middle message.
+        let tombstone =
+            Message::new("alice", "general", "[message deleted]").with_meta(MessageMeta::Deleted {
+                target_id: answer.id,
+                deleted_by: "alice".to_string(),
+                deleted_at: Utc::now(),
+            });
+        write("general", &tombstone);
+
+        // Both paths must agree.
+        syncer.sync_all().unwrap();
+        let after_sync = (
+            syncer
+                .index()
+                .reply_count(&question.id.to_string())
+                .unwrap(),
+            syncer.index().parent_of(&nested.id.to_string()).unwrap(),
+        );
+
+        syncer.rebuild().unwrap();
+        let after_rebuild = (
+            syncer
+                .index()
+                .reply_count(&question.id.to_string())
+                .unwrap(),
+            syncer.index().parent_of(&nested.id.to_string()).unwrap(),
+        );
+
+        assert_eq!(after_sync, after_rebuild);
+        assert_eq!(after_rebuild.0, 0, "the deleted reply no longer answers");
+        assert_eq!(
+            after_rebuild.1,
+            Some(answer.id.to_string()),
+            "the child keeps its anchor and stays dangling"
+        );
+    }
+
+    /// A channel that never uses threading must add nothing to the table.
+    #[test]
+    #[serial]
+    fn a_flat_channel_stores_no_reply_edges() {
+        let _env = TestEnv::new();
+
+        for body in ["one", "two", "three"] {
+            write("general", &Message::new("alice", "general", body));
+        }
+
+        let mut syncer = IndexSyncer::new().unwrap();
+        syncer.sync_all().unwrap();
+        assert_eq!(syncer.index().reply_edge_count().unwrap(), 0);
+
+        syncer.rebuild().unwrap();
+        assert_eq!(syncer.index().reply_edge_count().unwrap(), 0);
+    }
 }

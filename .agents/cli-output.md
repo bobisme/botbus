@@ -92,6 +92,13 @@ Understanding what fields represent helps agents make decisions:
 | `mentions` | List of @mentioned agents | Check if you're mentioned for actionable work |
 | `labels` | Message classification tags | Filter messages by topic/priority |
 | `ts` | Timestamp (RFC3339) | Sort by time, check recency |
+| `reply_to` | Message this one answers (ULID) | Absent means top-level. Use `rite history --thread <id>` to read the conversation |
+| `thread.root` | Topmost message of a thread | Present only for `--thread` reads |
+| `thread.complete` | Whether the whole chain is here | `false` means a parent is missing or deleted — treat the result as a fragment |
+| `thread.missing_parent` | Anchor that is not in the channel | Try `rite sync pull`, then read again |
+| `thread.depths` | Reply depth per message, same order as `messages` | Indent by this to render the shape |
+| `damaged_field_count` | (`doctor`) Field values this build could not read | If > 0, some data was dropped from records that were otherwise kept |
+| `damaged_fields` | (`doctor`) File, line, field, and value for each drop | A dropped `reply_to` means a reply now reads as top-level |
 | `next_offset` | Byte offset for next read | Use with `--after-offset` for incremental reading |
 | `marked_read` | Whether message was marked read | Tracks what you've processed |
 

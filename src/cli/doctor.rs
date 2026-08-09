@@ -19,7 +19,7 @@ use crate::core::project::{
     statuses_path,
 };
 use crate::core::status::AgentStatusEntry;
-use crate::storage::jsonl::{SkippedLine, scan_skipped};
+use crate::storage::jsonl::{DamagedField, ScanIssues, scan_issues};
 use crate::sync::git;
 
 /// How many skipped-line details to show before truncating.
@@ -53,13 +53,41 @@ pub struct SkippedRecord {
     pub error: String,
 }
 
-impl From<&SkippedLine> for SkippedRecord {
-    fn from(skip: &SkippedLine) -> Self {
+impl From<&crate::storage::jsonl::SkippedLine> for SkippedRecord {
+    fn from(skip: &crate::storage::jsonl::SkippedLine) -> Self {
         Self {
             file: skip.path.display().to_string(),
             line: skip.line,
             byte_offset: skip.byte_offset,
             error: skip.error.clone(),
+        }
+    }
+}
+
+/// A field dropped from a record that was otherwise read, as reported by doctor.
+///
+/// Separate from [`SkippedRecord`] because the consequences differ: a skipped
+/// line means a message is missing, a damaged field means a message is present
+/// but has lost part of its meaning. Today the only one is a reply anchor,
+/// whose loss turns a reply into a top-level message.
+#[derive(Debug, Clone, Serialize)]
+pub struct DamagedFieldRecord {
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    pub byte_offset: u64,
+    pub field: String,
+    pub value: String,
+}
+
+impl From<&DamagedField> for DamagedFieldRecord {
+    fn from(damaged: &DamagedField) -> Self {
+        Self {
+            file: damaged.path.display().to_string(),
+            line: damaged.line,
+            byte_offset: damaged.byte_offset,
+            field: damaged.field.to_string(),
+            value: damaged.value.clone(),
         }
     }
 }
@@ -79,6 +107,12 @@ pub struct DoctorReport {
     /// Details of the skipped lines (all of them, for machine consumers).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped_records: Vec<SkippedRecord>,
+    /// Total number of field values this build had to drop from records it
+    /// could otherwise read. Recomputed on every run, like the skip count.
+    pub damaged_field_count: usize,
+    /// Details of the dropped field values (all of them, for machine consumers).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub damaged_fields: Vec<DamagedFieldRecord>,
 }
 
 impl DoctorReport {
@@ -91,6 +125,8 @@ impl DoctorReport {
             advice: Vec::new(),
             skipped_line_count: 0,
             skipped_records: Vec::new(),
+            damaged_field_count: 0,
+            damaged_fields: Vec::new(),
         }
     }
 
@@ -378,28 +414,37 @@ fn is_writable(path: &Path) -> bool {
     }
 }
 
-/// Report JSONL lines that this build has to skip when reading.
+/// Report data this build has to drop when reading.
 ///
-/// Readers skip unreadable lines so one bad record cannot deny access to a
-/// whole file; this check makes that skipping visible. Note that a record
-/// carrying an unrecognized *type* is not skipped at all — it is kept verbatim
-/// (see [`crate::core::wire`]) and never appears here. Everything counted here
-/// is a line this build genuinely could not read. The counts are
-/// recomputed from disk on every run rather than persisted: whether a line is
-/// readable is a property of *this binary's* schema, not of the file, so a
-/// stored count would go stale the moment either side is upgraded, and writing
-/// to the data directory during a read-only health check would churn git sync.
+/// Two kinds, counted separately because they mean different things:
+///
+/// - **Skipped lines** — records this build could not read at all. Readers skip
+///   them so one bad record cannot deny access to a whole file.
+/// - **Damaged fields** — records this build read, minus one value it could not
+///   read. Today that is only `Message::reply_to`: an unreadable reply anchor
+///   is dropped so the message survives, which quietly turns a reply into a
+///   top-level message. Unquietly, thanks to this check.
+///
+/// Note that a record carrying an unrecognized *type* is neither: it is kept
+/// verbatim (see [`crate::core::wire`]) and never appears here. Everything
+/// counted here is data this build genuinely could not read.
+///
+/// The counts are recomputed from disk on every run rather than persisted:
+/// whether a value is readable is a property of *this binary's* schema, not of
+/// the file, so a stored count would go stale the moment either side is
+/// upgraded, and writing to the data directory during a read-only health check
+/// would churn git sync.
 fn check_record_readability(report: &mut DoctorReport) {
-    let mut skipped: Vec<SkippedLine> = Vec::new();
+    let mut issues = ScanIssues::default();
     let mut files_scanned = 0usize;
     let mut scan_errors: Vec<String> = Vec::new();
 
-    let mut scan = |result: Result<Vec<SkippedLine>>,
-                    skipped: &mut Vec<SkippedLine>,
+    let mut scan = |result: Result<ScanIssues>,
+                    issues: &mut ScanIssues,
                     files_scanned: &mut usize| match result {
-        Ok(lines) => {
+        Ok(found) => {
             *files_scanned += 1;
-            skipped.extend(lines);
+            issues.extend(found);
         }
         Err(e) => scan_errors.push(e.to_string()),
     };
@@ -415,8 +460,8 @@ fn check_record_readability(report: &mut DoctorReport) {
 
         for path in channel_files {
             scan(
-                scan_skipped::<Message>(&path),
-                &mut skipped,
+                scan_issues::<Message>(&path),
+                &mut issues,
                 &mut files_scanned,
             );
         }
@@ -424,28 +469,32 @@ fn check_record_readability(report: &mut DoctorReport) {
 
     // Top-level record files.
     scan(
-        scan_skipped::<FileClaim>(&claims_path()),
-        &mut skipped,
+        scan_issues::<FileClaim>(&claims_path()),
+        &mut issues,
         &mut files_scanned,
     );
     scan(
-        scan_skipped::<AgentStatusEntry>(&statuses_path()),
-        &mut skipped,
+        scan_issues::<AgentStatusEntry>(&statuses_path()),
+        &mut issues,
         &mut files_scanned,
     );
     scan(
-        scan_skipped::<crate::core::hook::Hook>(&hooks_path()),
-        &mut skipped,
+        scan_issues::<crate::core::hook::Hook>(&hooks_path()),
+        &mut issues,
         &mut files_scanned,
     );
     scan(
-        scan_skipped::<crate::core::hook::QueuedTrigger>(&hook_queue_path()),
-        &mut skipped,
+        scan_issues::<crate::core::hook::QueuedTrigger>(&hook_queue_path()),
+        &mut issues,
         &mut files_scanned,
     );
 
+    let ScanIssues { skipped, damaged } = issues;
+
     report.skipped_line_count = skipped.len();
     report.skipped_records = skipped.iter().map(SkippedRecord::from).collect();
+    report.damaged_field_count = damaged.len();
+    report.damaged_fields = damaged.iter().map(DamagedFieldRecord::from).collect();
 
     if !scan_errors.is_empty() {
         report.add(Check {
@@ -457,7 +506,7 @@ fn check_record_readability(report: &mut DoctorReport) {
         return;
     }
 
-    if skipped.is_empty() {
+    if skipped.is_empty() && damaged.is_empty() {
         report.add(Check {
             name: "record_readability".to_string(),
             status: CheckStatus::Pass,
@@ -467,39 +516,59 @@ fn check_record_readability(report: &mut DoctorReport) {
         return;
     }
 
-    let mut files: Vec<&Path> = skipped.iter().map(|s| s.path.as_path()).collect();
+    let mut files: Vec<&Path> = skipped
+        .iter()
+        .map(|s| s.path.as_path())
+        .chain(damaged.iter().map(|d| d.path.as_path()))
+        .collect();
     files.sort_unstable();
     files.dedup();
 
-    let detail = skipped
-        .iter()
-        .take(MAX_SKIPPED_DETAILS)
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join("; ");
+    let mut parts: Vec<String> = Vec::new();
+    if !skipped.is_empty() {
+        parts.push(format!(
+            "skipped {} unreadable line(s): {}",
+            skipped.len(),
+            detail_of(skipped.iter().map(|s| s.to_string()), skipped.len())
+        ));
+    }
+    if !damaged.is_empty() {
+        parts.push(format!(
+            "dropped {} unreadable field value(s): {}",
+            damaged.len(),
+            detail_of(damaged.iter().map(|d| d.to_string()), damaged.len())
+        ));
+    }
+
+    let mut suggestion = String::from(
+        "This data is damaged, or was written by a rite that changed a record type this build \
+         already knows — records whose type is merely unrecognized are read fine and are not \
+         counted here. Inspect the reported file and line; upgrade this install \
+         (cargo install rite) if the writer is newer.",
+    );
+    if !damaged.is_empty() {
+        suggestion.push_str(
+            " A dropped `reply_to` makes a reply read as a top-level message, so anything \
+             waiting on an answer to a specific message will not see it.",
+        );
+    }
 
     report.add(Check {
         name: "record_readability".to_string(),
         status: CheckStatus::Warn,
-        message: format!(
-            "Skipped {} unreadable line(s) across {} file(s): {}{}",
-            skipped.len(),
-            files.len(),
-            detail,
-            if skipped.len() > MAX_SKIPPED_DETAILS {
-                format!(" (+{} more)", skipped.len() - MAX_SKIPPED_DETAILS)
-            } else {
-                String::new()
-            }
-        ),
-        suggestion: Some(
-            "These lines are damaged, or were written by a rite that changed a record type this \
-             build already knows — records whose type is merely unrecognized are read fine and \
-             are not counted here. Inspect the reported file and line; upgrade this install \
-             (cargo install rite) if the writer is newer."
-                .to_string(),
-        ),
+        message: format!("Across {} file(s): {}", files.len(), parts.join("; and ")),
+        suggestion: Some(suggestion),
     });
+}
+
+/// Join the first few details, noting how many were left out.
+fn detail_of(details: impl Iterator<Item = String>, total: usize) -> String {
+    let shown: Vec<String> = details.take(MAX_SKIPPED_DETAILS).collect();
+    let mut text = shown.join("; ");
+    if total > MAX_SKIPPED_DETAILS {
+        text.push_str(&format!(" (+{} more)", total - MAX_SKIPPED_DETAILS));
+    }
+    text
 }
 
 fn check_git_available(report: &mut DoctorReport) {
@@ -653,7 +722,15 @@ mod tests {
         assert!(report.skipped_records[0].error.contains("corrupt"));
         assert_eq!(report.skipped_records[1].line, Some(4));
         assert!(report.skipped_records[0].file.ends_with("general.jsonl"));
-        assert!(report.checks[0].message.contains("Skipped 2 unreadable"));
+        assert!(
+            report.checks[0]
+                .message
+                .contains("skipped 2 unreadable line")
+        );
+        assert_eq!(
+            report.damaged_field_count, 0,
+            "a lost line is not a damaged field"
+        );
 
         // A clean data directory passes and reports a zero count.
         fs::remove_file(&channel).unwrap();
@@ -661,6 +738,95 @@ mod tests {
         let mut clean = DoctorReport::new();
         check_record_readability(&mut clean);
         assert_eq!(clean.skipped_line_count, 0);
+        assert_eq!(clean.damaged_field_count, 0);
+        assert_eq!(clean.pass_count, 1);
+
+        unsafe {
+            env::remove_var(DATA_DIR_ENV_VAR);
+        }
+    }
+
+    /// A dropped reply anchor is data loss. It must be counted and named, not
+    /// merely absent — an anchor that vanishes quietly stops an acknowledgment
+    /// from correlating with the request it answers, and nothing would say why.
+    #[test]
+    #[serial]
+    fn test_doctor_reports_dropped_reply_anchors() {
+        use std::io::Write;
+
+        let temp = TempDir::new().unwrap();
+        unsafe {
+            env::set_var(DATA_DIR_ENV_VAR, temp.path().to_str().unwrap());
+        }
+
+        let channels = temp.path().join("channels");
+        fs::create_dir_all(&channels).unwrap();
+        let channel = channels.join("general.jsonl");
+
+        let question = crate::core::message::Message::new("alice", "general", "question");
+        let answer = crate::core::message::Message::new("bob", "general", "answer")
+            .with_reply_to(question.id);
+        crate::storage::jsonl::append_record(&channel, &question).unwrap();
+        crate::storage::jsonl::append_record(&channel, &answer).unwrap();
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&channel).unwrap();
+            // Line 3: an anchor that is not a ULID.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","agent":"mangled","channel":"general","body":"bad anchor","reply_to":"????"}}"#
+            )
+            .unwrap();
+            // Line 4: an anchor a newer rite gave a different shape.
+            writeln!(
+                file,
+                r#"{{"ts":"2026-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FBW","agent":"future","channel":"general","body":"future anchor","reply_to":{{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}}}}"#
+            )
+            .unwrap();
+        }
+
+        let mut report = DoctorReport::new();
+        check_record_readability(&mut report);
+
+        assert_eq!(
+            report.skipped_line_count, 0,
+            "the records themselves are readable and must be kept"
+        );
+        assert_eq!(report.damaged_field_count, 2);
+        assert_eq!(report.warn_count, 1, "lost data cannot be a Pass");
+
+        assert_eq!(report.damaged_fields.len(), 2);
+        for record in &report.damaged_fields {
+            assert_eq!(record.field, crate::core::message::REPLY_TO_FIELD);
+            assert!(record.file.ends_with("general.jsonl"));
+        }
+        assert_eq!(report.damaged_fields[0].line, Some(3));
+        assert!(report.damaged_fields[0].value.contains("????"));
+        assert_eq!(report.damaged_fields[1].line, Some(4));
+
+        // The human-visible line names the count, the field, and the file.
+        let message = &report.checks[0].message;
+        assert!(
+            message.contains("dropped 2 unreadable field value"),
+            "{message}"
+        );
+        assert!(message.contains("reply_to"), "{message}");
+        assert!(message.contains("general.jsonl"), "{message}");
+        assert!(
+            report.checks[0]
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("reply_to"),
+            "the suggestion must explain what a lost anchor costs"
+        );
+
+        // A valid anchor is not damage.
+        fs::remove_file(&channel).unwrap();
+        crate::storage::jsonl::append_record(&channel, &question).unwrap();
+        crate::storage::jsonl::append_record(&channel, &answer).unwrap();
+        let mut clean = DoctorReport::new();
+        check_record_readability(&mut clean);
+        assert_eq!(clean.damaged_field_count, 0);
         assert_eq!(clean.pass_count, 1);
 
         unsafe {

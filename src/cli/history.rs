@@ -5,6 +5,7 @@ use chrono::{DateTime, Local, Utc};
 use colored::Colorize;
 use serde::Serialize;
 use std::path::Path;
+use ulid::Ulid;
 
 use super::OutputFormat;
 use crate::core::channel::resolve_channel;
@@ -12,7 +13,8 @@ use crate::core::identity::resolve_agent;
 use crate::core::message::{
     Message, read_last_n_messages, read_messages, read_messages_from_offset_limited,
 };
-use crate::core::project::channel_path;
+use crate::core::project::{channel_path, channels_dir};
+use crate::core::thread::{RootKind, collect_thread};
 
 #[derive(Clone)]
 pub struct HistoryOptions {
@@ -32,6 +34,8 @@ pub struct HistoryOptions {
     pub after_offset: Option<u64>,
     /// Read messages after this message ID (ULID)
     pub after_id: Option<String>,
+    /// Return the whole thread containing this message ID (ULID)
+    pub thread: Option<String>,
     /// Show the offset info for next read
     pub show_offset: bool,
     /// Output format
@@ -50,8 +54,38 @@ pub struct HistoryOutput {
     pub last_id: Option<String>,
     /// Total messages available before count limit was applied (for pagination awareness)
     pub total_available: usize,
+    /// Thread structure, present only for `--thread` reads. Absent otherwise,
+    /// so a flat read serializes exactly as it did before threading existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advice: Vec<String>,
+}
+
+/// Shape of the thread returned by `--thread`.
+#[derive(Debug, Serialize)]
+pub struct ThreadInfo {
+    /// The message the caller named.
+    pub anchor: String,
+    /// Topmost ancestor reachable from the anchor.
+    pub root: String,
+    /// Channel the thread lives in.
+    pub channel: String,
+    /// How the root was reached: `root`, `resolved`, `missing_parent`,
+    /// `self_reference`, `cycle`, or `depth_limit`. Anything other than the
+    /// first two means the thread is the best available answer, not the whole
+    /// conversation.
+    pub kind: RootKind,
+    /// True when `kind` is `root` or `resolved`.
+    pub complete: bool,
+    /// The anchor the root points at that is not in this channel: not synced
+    /// yet, or deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_parent: Option<String>,
+    /// Reply depth of each message, parallel to `messages`. The root is 0.
+    pub depths: Vec<usize>,
+    /// Messages in the thread, root included.
+    pub size: usize,
 }
 
 /// View message history.
@@ -62,13 +96,21 @@ pub fn run(options: HistoryOptions) -> Result<()> {
         .channel
         .clone()
         .unwrap_or_else(|| "general".to_string());
-    let channel = resolve_channel(&raw_channel, agent.as_deref()).ok_or_else(|| {
+    let mut channel = resolve_channel(&raw_channel, agent.as_deref()).ok_or_else(|| {
         anyhow!(
             "Cannot resolve DM channel '{}' without agent identity.\n\
              Set RITE_AGENT or use --agent flag.",
             raw_channel
         )
     })?;
+
+    // A message id is channel-agnostic to whoever holds it: `rite wait` and
+    // hooks hand out an id, not a location. So --thread accepts the id alone
+    // and finds the channel, preferring the one the caller named.
+    if let Some(raw_anchor) = &options.thread {
+        let anchor = parse_message_id(raw_anchor)?;
+        channel = locate_thread_channel(anchor, &channel)?;
+    }
 
     let resolved_options = HistoryOptions {
         channel: Some(channel.clone()),
@@ -120,9 +162,17 @@ pub fn run(options: HistoryOptions) -> Result<()> {
             // Print header
             println!("{}", format!("#{}", channel).cyan().bold());
 
-            // Print messages
-            for msg in &output.messages {
-                print_message(msg);
+            // Print messages. A thread is indented by reply depth so the shape
+            // of the conversation is visible; a flat read is untouched.
+            if let Some(info) = &output.thread {
+                print_thread_header(info);
+                for (msg, depth) in output.messages.iter().zip(info.depths.iter()) {
+                    print_message_indented(msg, *depth);
+                }
+            } else {
+                for msg in &output.messages {
+                    print_message(msg);
+                }
             }
 
             // Show offset info for next read
@@ -146,14 +196,32 @@ pub fn run(options: HistoryOptions) -> Result<()> {
             }
         }
         OutputFormat::Text => {
-            // Text format: concise one-liner per message
-            for msg in &output.messages {
-                let time_ago = format_time_ago(msg.ts);
-                let labels = format_label_badges(&msg.labels);
-                println!(
-                    "{}  {}  {}  {}{}",
-                    msg.id, msg.agent, time_ago, labels, msg.body
-                );
+            // Thread reads add a leading depth column and a trailing summary.
+            // A flat read keeps the exact line shape it has always had.
+            if let Some(info) = &output.thread {
+                for (msg, depth) in output.messages.iter().zip(info.depths.iter()) {
+                    let time_ago = format_time_ago(msg.ts);
+                    let labels = format_label_badges(&msg.labels);
+                    println!(
+                        "{}  {}  {}  {}  {}{}",
+                        depth, msg.id, msg.agent, time_ago, labels, msg.body
+                    );
+                }
+                println!("thread_root: {}", info.root);
+                println!("thread_size: {}", info.size);
+                println!("thread_complete: {}", info.complete);
+                if let Some(missing) = &info.missing_parent {
+                    println!("thread_missing_parent: {}", missing);
+                }
+            } else {
+                for msg in &output.messages {
+                    let time_ago = format_time_ago(msg.ts);
+                    let labels = format_label_badges(&msg.labels);
+                    println!(
+                        "{}  {}  {}  {}{}",
+                        msg.id, msg.agent, time_ago, labels, msg.body
+                    );
+                }
             }
 
             // Follow mode
@@ -203,12 +271,20 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
             next_offset: 0,
             last_id: None,
             total_available: 0,
+            thread: None,
             advice: vec![],
         });
     }
 
     // Get file size for next_offset calculation
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    // Thread reads answer a different question from the flat paths below —
+    // "what belongs with this message" rather than "what is recent" — so they
+    // short-circuit rather than layering on top of count and offset filters.
+    if let Some(raw_anchor) = &options.thread {
+        return read_thread(&path, &channel, raw_anchor, file_size);
+    }
 
     // Resolve --after-id to a byte offset so it shares the lossless offset-based
     // read path. Routing it through read_messages_from_offset_limited keeps
@@ -267,6 +343,135 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
         next_offset,
         last_id,
         total_available,
+        thread: None,
+        advice,
+    })
+}
+
+/// Parse a ULID argument, with a message that says what a good one looks like.
+fn parse_message_id(raw: &str) -> Result<Ulid> {
+    raw.trim().parse::<Ulid>().map_err(|_| {
+        anyhow!(
+            "Invalid message ID: '{}'\n\n\
+             Expected a ULID, as printed by `rite send --format json` or \
+             carried in $RITE_MESSAGE_ID inside a hook.",
+            raw
+        )
+    })
+}
+
+/// Find the channel holding `anchor`, preferring `preferred`.
+///
+/// Scans every channel only when the preferred one does not have it, so the
+/// common case (the caller knows the channel) costs one file read.
+fn locate_thread_channel(anchor: Ulid, preferred: &str) -> Result<String> {
+    let anchor_text = anchor.to_string();
+
+    let preferred_path = channel_path(preferred);
+    if preferred_path.exists()
+        && crate::core::message::offset_after_message_id(&preferred_path, &anchor_text)?.is_some()
+    {
+        return Ok(preferred.to_string());
+    }
+
+    let dir = channels_dir();
+    if dir.exists() {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .with_context(|| "Failed to read channels directory")?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_string())
+            })
+            .collect();
+        // Deterministic order, so a duplicated id resolves the same way twice.
+        names.sort();
+
+        for name in names {
+            if name == preferred {
+                continue;
+            }
+            let path = channel_path(&name);
+            if crate::core::message::offset_after_message_id(&path, &anchor_text)?.is_some() {
+                return Ok(name);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Message {} is not in #{} or any other channel.\n\n\
+         It may not have synced to this machine yet, or it may have been deleted.\n\
+         Try: rite sync pull",
+        anchor,
+        preferred
+    ))
+}
+
+/// Build the thread output for `--thread`.
+fn read_thread(
+    path: &Path,
+    channel: &str,
+    raw_anchor: &str,
+    file_size: u64,
+) -> Result<HistoryOutput> {
+    let anchor = parse_message_id(raw_anchor)?;
+
+    let all: Vec<Message> =
+        read_messages(path).with_context(|| format!("Failed to read channel #{}", channel))?;
+
+    // `read_messages` has already dropped tombstoned messages, so a deleted
+    // parent reaches the walk as a missing one — one code path, both cases.
+    let thread = collect_thread(&all, anchor).ok_or_else(|| {
+        anyhow!(
+            "Message {} is not in #{}.\n\n\
+             It may have been deleted, or it may not have synced here yet.",
+            anchor,
+            channel
+        )
+    })?;
+
+    let messages: Vec<Message> = thread
+        .messages
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect();
+    let depths: Vec<usize> = thread.messages.iter().map(|entry| entry.depth).collect();
+    let last_id = messages.last().map(|m| m.id.to_string());
+
+    let mut advice = Vec::new();
+    if let Some(missing) = thread.missing_parent {
+        advice.push(format!(
+            "thread is a fragment: parent {} is not in #{} (try: rite sync pull)",
+            missing, channel
+        ));
+    }
+    if matches!(thread.kind, RootKind::Cycle | RootKind::SelfReference) {
+        advice.push(format!(
+            "reply anchors in this thread form a loop ({:?}); the walk stopped at the repeat",
+            thread.kind
+        ));
+    }
+
+    let info = ThreadInfo {
+        anchor: anchor.to_string(),
+        root: thread.root.to_string(),
+        channel: channel.to_string(),
+        kind: thread.kind,
+        complete: thread.kind.is_complete(),
+        missing_parent: thread.missing_parent.map(|id| id.to_string()),
+        depths,
+        size: messages.len(),
+    };
+
+    Ok(HistoryOutput {
+        total_available: messages.len(),
+        messages,
+        next_offset: file_size,
+        last_id,
+        thread: Some(info),
         advice,
     })
 }
@@ -331,6 +536,54 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     }
 
     anyhow::bail!("Could not parse datetime: {}", s)
+}
+
+/// Announce what a `--thread` read actually returned.
+///
+/// A fragment says so on the line above the messages. Printing a dangling
+/// child under a plain header would be the silent promotion this command
+/// exists to avoid.
+fn print_thread_header(info: &ThreadInfo) {
+    if info.complete {
+        println!(
+            "{} {} ({} message{})",
+            "thread:".dimmed(),
+            info.root.cyan(),
+            info.size,
+            if info.size == 1 { "" } else { "s" }
+        );
+        return;
+    }
+
+    match &info.missing_parent {
+        Some(missing) => println!(
+            "{} {} ({} message{}) — {}",
+            "thread:".dimmed(),
+            info.root.cyan(),
+            info.size,
+            if info.size == 1 { "" } else { "s" },
+            format!("fragment: parent {} is not here", missing).yellow()
+        ),
+        None => println!(
+            "{} {} ({} message{}) — {}",
+            "thread:".dimmed(),
+            info.root.cyan(),
+            info.size,
+            if info.size == 1 { "" } else { "s" },
+            format!(
+                "reply anchors loop ({:?}); walk stopped at the repeat",
+                info.kind
+            )
+            .yellow()
+        ),
+    }
+}
+
+fn print_message_indented(msg: &Message, depth: usize) {
+    // Two spaces per level, capped so a deep thread stays on screen.
+    let indent = "  ".repeat(depth.min(12));
+    print!("{}", indent);
+    print_message(msg);
 }
 
 fn print_message(msg: &Message) {
@@ -661,6 +914,7 @@ mod tests {
             labels: vec![],
             after_offset: None,
             after_id: None,
+            thread: None,
             show_offset: false,
             format: OutputFormat::Text,
             agent: None,
@@ -686,6 +940,7 @@ mod tests {
             labels: vec![],
             after_offset: None,
             after_id: None,
+            thread: None,
             show_offset: false,
             format: OutputFormat::Text,
             agent: None,
@@ -729,6 +984,7 @@ mod tests {
             labels: vec![],
             after_offset: Some(0),
             after_id: None,
+            thread: None,
             show_offset: false,
             format: OutputFormat::Text,
             agent: None,
@@ -779,6 +1035,7 @@ mod tests {
             labels: vec![],
             after_offset: None,
             after_id: None,
+            thread: None,
             show_offset: false,
             format: OutputFormat::Text,
             agent: None,

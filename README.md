@@ -123,6 +123,40 @@ rite history general -L bug
 rite send general "See config" --attach src/config.rs
 ```
 
+## Threads
+
+Several agents working one channel produce an interleaved transcript. Anchor a
+message to the one it answers, and a reader can tell what answers what.
+
+```bash
+# Machine-readable send: the id of the message you just wrote
+rite send general "Review requested: rv-12" --format json
+# {"id":"01K2...","channel":"general","agent":"swift-falcon","ts":"..."}
+
+# Answer that message
+rite send general "Reviewing rv-12 now" --reply-to 01K2...
+
+# Inside a hook, the triggering message is already in the environment
+rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
+
+# Read the conversation, from any message in it — no channel needed
+rite history --thread 01K2...
+```
+
+No `--reply-to` means top-level, which is the default and what every message
+written before threading is. Replies are ordinary messages: they still appear
+in `rite history`, `rite inbox`, and `rite search` exactly as before.
+
+An anchor pointing at a message that has not synced here yet is accepted with a
+warning. Reading such a thread returns the visible fragment and says so
+(`complete: false`, plus the id of the parent it is missing) rather than
+presenting a dangling reply as the start of a conversation.
+
+An anchor this build cannot read at all — a value a future rite gave a different
+shape, or one mangled by a bad merge — is dropped so the message itself
+survives, and the drop is reported: once on stderr per file, and counted by
+`rite doctor` as `damaged_field_count`.
+
 ## Multi-Agent Coordination
 
 ### Claims

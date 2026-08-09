@@ -34,6 +34,13 @@ pub const QUICK_REFERENCE: &str = r#"QUICK REFERENCE
       rite wait --mentions -t 300
       rite history @other-agent -f
 
+  Answer a specific message (threads)
+
+      rite send general "Review 42 ready" --format json    # prints the new id
+      rite send general "on it" --reply-to <message-id>
+      rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
+      rite history --thread <message-id>
+
   Stream mentions and DMs (one process, all channels, JSONL)
 
       rite mentions follow --format json
@@ -94,6 +101,8 @@ mod tests {
             "Continue a conversation",
             "rite mark-read general",
             "--format json",
+            "--reply-to",
+            "rite history --thread",
         ] {
             assert!(
                 QUICK_REFERENCE.contains(expected),

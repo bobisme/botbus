@@ -34,6 +34,17 @@ pub struct SearchResult {
     pub rank: f64,
 }
 
+/// A reply edge read back out of the index.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyEdge {
+    /// The replying message.
+    pub id: String,
+    /// The message it answers.
+    pub reply_to: String,
+    pub channel: String,
+    pub ts: String,
+}
+
 /// Full-text search index backed by SQLite FTS5.
 pub struct SearchIndex {
     conn: Connection,
@@ -76,6 +87,8 @@ impl SearchIndex {
             )
             .with_context(|| "Failed to insert into FTS")?;
 
+        index_reply_edge(&self.conn, msg)?;
+
         Ok(())
     }
 
@@ -95,11 +108,76 @@ impl SearchIndex {
                 "INSERT OR REPLACE INTO messages_fts (id, channel, agent, body, ts) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![id, msg.channel, msg.agent, msg.body, ts],
             )?;
+
+            index_reply_edge(&tx, msg)?;
         }
 
         tx.commit()?;
 
         Ok(messages.len())
+    }
+
+    /// Direct replies to `parent_id`, oldest first.
+    ///
+    /// ULIDs sort chronologically, so ordering by `id` is creation order and
+    /// needs no timestamp comparison across machines.
+    ///
+    /// This is the startup half of `rite wait --reply-to`: the tail of a
+    /// channel catches replies that arrive after the wait begins, and this
+    /// catches the one that arrived a moment before it, without reading a
+    /// single channel file.
+    pub fn replies_to(&self, parent_id: &str) -> Result<Vec<ReplyEdge>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, reply_to, channel, ts FROM message_replies WHERE reply_to = ?1 ORDER BY id",
+        )?;
+
+        let replies = stmt
+            .query_map(params![parent_id], |row| {
+                Ok(ReplyEdge {
+                    id: row.get(0)?,
+                    reply_to: row.get(1)?,
+                    channel: row.get(2)?,
+                    ts: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(replies)
+    }
+
+    /// How many messages answer `parent_id`.
+    pub fn reply_count(&self, parent_id: &str) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM message_replies WHERE reply_to = ?1",
+            params![parent_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// The message `id` answers, if the index knows of one.
+    ///
+    /// `None` means either "not a reply" or "not indexed yet". Callers that
+    /// must tell those apart read the JSONL, which is the source of truth.
+    pub fn parent_of(&self, id: &str) -> Result<Option<String>> {
+        let parent: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT reply_to FROM message_replies WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(parent)
+    }
+
+    /// Total reply edges held by the index.
+    pub fn reply_edge_count(&self) -> Result<usize> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM message_replies", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     /// Search for messages matching a query.
@@ -201,23 +279,60 @@ impl SearchIndex {
         Ok(count as usize)
     }
 
-    /// Delete a specific message from the FTS index by its ULID ID.
+    /// Delete a specific message from the index by its ULID ID.
+    ///
+    /// Drops the message's own reply edge as well. Edges *pointing at* it are
+    /// left alone on purpose: its children are still real messages, and losing
+    /// their anchor would turn them into roots, which is exactly the silent
+    /// promotion the thread walk exists to prevent. They resolve as
+    /// [`crate::core::thread::RootKind::MissingParent`] instead.
     pub fn delete_message(&self, id: &str) -> Result<bool> {
         let changes = self
             .conn
             .execute("DELETE FROM messages_fts WHERE id = ?1", params![id])
             .with_context(|| format!("Failed to delete message {} from FTS", id))?;
 
+        self.conn
+            .execute("DELETE FROM message_replies WHERE id = ?1", params![id])
+            .with_context(|| format!("Failed to delete reply edge for {}", id))?;
+
         Ok(changes > 0)
     }
 
-    /// Clear all messages from the FTS index.
+    /// Clear all messages from the index.
     pub fn clear(&self) -> Result<()> {
         self.conn
             .execute("DELETE FROM messages_fts", [])
             .with_context(|| "Failed to clear FTS index")?;
+        self.conn
+            .execute("DELETE FROM message_replies", [])
+            .with_context(|| "Failed to clear reply edges")?;
         Ok(())
     }
+}
+
+/// Record `msg`'s reply edge, if it has one.
+///
+/// Uses [`Message::parent_id`], so a message that anchors to itself stores no
+/// edge — a self-edge here would make `replies_to(x)` return `x` and spin any
+/// consumer that walks the result.
+fn index_reply_edge(conn: &Connection, msg: &Message) -> Result<()> {
+    let Some(parent) = msg.parent_id() else {
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT OR REPLACE INTO message_replies (id, reply_to, channel, ts) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            msg.id.to_string(),
+            parent.to_string(),
+            msg.channel,
+            msg.ts.to_rfc3339()
+        ],
+    )
+    .with_context(|| format!("Failed to index reply edge for {}", msg.id))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,6 +369,7 @@ mod tests {
             body: body.to_string(),
             mentions: vec![],
             labels: vec![],
+            reply_to: None,
             attachments: vec![],
             meta: None,
         }
@@ -325,6 +441,116 @@ mod tests {
 
         index.set_sync_offset("general", 1234).unwrap();
         assert_eq!(index.get_sync_offset("general").unwrap(), 1234);
+    }
+
+    #[test]
+    fn test_reply_edges_are_queryable_by_parent() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let parent = make_message("general", "Alice", "Review 42 please");
+        let first = make_message("general", "Bob", "on it").with_reply_to(parent.id);
+        let second = make_message("general", "Carol", "done").with_reply_to(parent.id);
+        let unrelated = make_message("general", "Dave", "unrelated");
+
+        index
+            .index_messages(&[
+                parent.clone(),
+                first.clone(),
+                second.clone(),
+                unrelated.clone(),
+            ])
+            .unwrap();
+
+        let replies = index.replies_to(&parent.id.to_string()).unwrap();
+        assert_eq!(replies.len(), 2);
+        // ULID order is creation order.
+        let mut ids = vec![first.id.to_string(), second.id.to_string()];
+        ids.sort();
+        assert_eq!(
+            replies.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(replies[0].channel, "general");
+
+        assert_eq!(index.reply_count(&parent.id.to_string()).unwrap(), 2);
+        assert_eq!(index.reply_count(&unrelated.id.to_string()).unwrap(), 0);
+
+        assert_eq!(
+            index.parent_of(&first.id.to_string()).unwrap(),
+            Some(parent.id.to_string())
+        );
+        assert_eq!(index.parent_of(&unrelated.id.to_string()).unwrap(), None);
+
+        // Only replies take a row.
+        assert_eq!(index.reply_edge_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_reply_edge_indexing_is_idempotent() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let parent = make_message("general", "Alice", "question");
+        let reply = make_message("general", "Bob", "answer").with_reply_to(parent.id);
+
+        index
+            .index_messages(&[parent.clone(), reply.clone()])
+            .unwrap();
+        index
+            .index_messages(&[parent.clone(), reply.clone()])
+            .unwrap();
+        index.index_message(&reply).unwrap();
+
+        assert_eq!(index.reply_count(&parent.id.to_string()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_self_referencing_message_stores_no_edge() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let mut looped = make_message("general", "Alice", "me");
+        looped.reply_to = Some(looped.id);
+
+        index.index_messages(&[looped.clone()]).unwrap();
+
+        assert!(index.replies_to(&looped.id.to_string()).unwrap().is_empty());
+        assert_eq!(index.reply_edge_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_drops_own_edge_but_keeps_children() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let root = make_message("general", "Alice", "question");
+        let middle = make_message("general", "Bob", "answer").with_reply_to(root.id);
+        let leaf = make_message("general", "Carol", "follow-up").with_reply_to(middle.id);
+
+        index
+            .index_messages(&[root.clone(), middle.clone(), leaf.clone()])
+            .unwrap();
+
+        index.delete_message(&middle.id.to_string()).unwrap();
+
+        // The deleted message no longer answers anything…
+        assert!(index.replies_to(&root.id.to_string()).unwrap().is_empty());
+        // …but its child keeps its anchor, so it stays a dangling child rather
+        // than being promoted to a root.
+        assert_eq!(
+            index.parent_of(&leaf.id.to_string()).unwrap(),
+            Some(middle.id.to_string())
+        );
+    }
+
+    #[test]
+    fn test_clear_drops_reply_edges() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let parent = make_message("general", "Alice", "question");
+        let reply = make_message("general", "Bob", "answer").with_reply_to(parent.id);
+        index.index_messages(&[parent, reply]).unwrap();
+        assert_eq!(index.reply_edge_count().unwrap(), 1);
+
+        index.clear().unwrap();
+        assert_eq!(index.reply_edge_count().unwrap(), 0);
     }
 
     #[test]
