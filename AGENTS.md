@@ -44,7 +44,7 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 | `inbox` | `rite inbox [-c channels] [--all] [--mentions] [-n count] [--mark-read] [--count-only]` |
 | `mark-read` | `rite mark-read <channel>` |
 | `search` | `rite search <query> [-c channel] [-n count] [--from]` |
-| `wait` | `rite wait [-c channel] [--mentions] [--from agent] [-L label] [-t timeout]` |
+| `wait` | `rite wait [-c channel] [--mentions] [--from agent] [-L label] [--reply-to id] [-t timeout]` |
 | `watch` | `rite watch [channel]` — stream messages in real-time |
 | `mentions follow` | `rite mentions follow --format json [--no-dms] [-L label]` — JSONL stream of every message mentioning you, across all channels, plus your DMs |
 | `status` | `rite status` — overview of agents, channels, claims |
@@ -127,6 +127,31 @@ Rules:
   drop is reported: once on stderr per file, and counted by `rite doctor` as
   `damaged_field_count`. A reply that quietly became top-level is how an
   acknowledgment stops correlating, so it is never silent.
+
+### Acknowledgment
+
+Do not post a request and guess whether it landed. Block on the answer.
+
+```bash
+id=$(rite send rite "Review requested: rv-12 @rite-security" --format json | jq -r .id)
+rite wait --reply-to "$id" -t 300 --format json
+```
+
+Exit codes:
+
+| exit | meaning | what to do |
+|------|---------|------------|
+| 0 | answered | read `message` from the JSON |
+| 1 | nobody answered inside `-t` | escalate. Do not send the request again |
+| 2 | the id is not a ULID, or this store never saw it | fix the id |
+
+`--reply-to` narrows the other flags. `--mentions` and `-c` are places, so they
+combine with OR. `--reply-to` is one question, and `--from`, `-c`, and `-L`
+only remove candidate answers from it. With no `-c`, every channel is watched,
+so a reply in a DM counts. Your own reply does not acknowledge you. A reply
+that landed before the wait started is still reported, so there is no race
+between `rite send` and `rite wait`. Use `--allow-missing-parent` only when the
+parent is still syncing in from another machine.
 
 ### Message Flags
 

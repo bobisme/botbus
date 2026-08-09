@@ -172,6 +172,22 @@ impl SearchIndex {
         Ok(parent)
     }
 
+    /// True when the index holds a message with this id.
+    ///
+    /// A `false` is not proof of absence: the index is derived, so it can be
+    /// stale, absent, or missing a channel that failed to sync. Callers that
+    /// act on a negative answer — `rite wait --reply-to` refusing an id it has
+    /// never seen — must confirm it against the JSONL, which is the source of
+    /// truth.
+    pub fn has_message(&self, id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages_fts WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Total reply edges held by the index.
     pub fn reply_edge_count(&self) -> Result<usize> {
         let count: i64 =
@@ -441,6 +457,26 @@ mod tests {
 
         index.set_sync_offset("general", 1234).unwrap();
         assert_eq!(index.get_sync_offset("general").unwrap(), 1234);
+    }
+
+    /// `has_message` is what `rite wait --reply-to` asks before it agrees to
+    /// block. It must answer for any message, not only ones that are replies.
+    #[test]
+    fn test_has_message() {
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        let known = make_message("general", "Alice", "Review 42 please");
+        let absent = make_message("general", "Alice", "never indexed");
+        index.index_messages(&[known.clone()]).unwrap();
+
+        assert!(index.has_message(&known.id.to_string()).unwrap());
+        assert!(!index.has_message(&absent.id.to_string()).unwrap());
+        assert!(!index.has_message("not-a-ulid").unwrap());
+
+        // A deleted message stops being known, which is why a negative answer
+        // is confirmed against the JSONL before anyone acts on it.
+        index.delete_message(&known.id.to_string()).unwrap();
+        assert!(!index.has_message(&known.id.to_string()).unwrap());
     }
 
     #[test]

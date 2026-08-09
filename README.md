@@ -236,6 +236,45 @@ rite wait --mention -t 300
 rite wait -L review -t 120
 ```
 
+#### Acknowledgment: did anyone hear me?
+
+`--reply-to` blocks until one *specific* message is answered. Without it an
+agent cannot tell "heard, working on it" from "shouted into the void", so it
+asks again, and again.
+
+```bash
+id=$(rite send rite "Review requested: rv-12 @rite-security" --format json | jq -r .id)
+
+rite wait --reply-to "$id" -t 300 --format json
+case $? in
+  0) ;;  # answered — the JSON carries the answering message
+  1) ;;  # nobody answered inside 300s. Escalate. Do not send the request again
+  2) ;;  # the id is not a ULID, or this store has never seen it
+esac
+```
+
+The reply side needs nothing new — inside a hook the triggering id is already
+in the environment:
+
+```bash
+rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
+```
+
+Rules:
+
+- `--reply-to` **narrows**. `--mentions` and `-c` name places a message might
+  turn up, so they combine with OR. `--reply-to` names one question, and
+  `--from`, `-c`, and `-L` only remove candidate answers from it. A wait that
+  ended on an unrelated message would report an answer nobody gave.
+- With no `-c`, every channel is watched, so a reply in a DM still counts.
+- Your own reply to your own message is not an acknowledgment.
+- A reply that landed before the wait started is still reported. There is no
+  race between `rite send` and `rite wait`.
+- An id this store has never seen exits `2` immediately instead of blocking.
+  A mistyped id that merely timed out is how a requester concludes it was
+  ignored. Use `--allow-missing-parent` when the parent is still syncing in
+  from another machine.
+
 ### Hooks
 
 Hooks let you trigger shell commands when messages arrive on channels. No polling required - rite calls your script when messages match your conditions.

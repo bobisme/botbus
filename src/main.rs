@@ -310,6 +310,8 @@ fn main() -> Result<()> {
             channels,
             labels,
             from,
+            reply_to,
+            allow_missing_parent,
             timeout,
         } => cli::wait::run(
             cli::wait::WaitOptions {
@@ -317,6 +319,8 @@ fn main() -> Result<()> {
                 channels,
                 labels,
                 from,
+                reply_to,
+                allow_missing_parent,
                 timeout,
                 format,
             },

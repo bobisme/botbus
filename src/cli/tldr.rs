@@ -41,6 +41,11 @@ pub const QUICK_REFERENCE: &str = r#"QUICK REFERENCE
       rite send "$RITE_CHANNEL" "on it" --reply-to "$RITE_MESSAGE_ID"
       rite history --thread <message-id>
 
+  Block until YOUR message is answered (exit 0 answered, 1 timed out, 2 bad id)
+
+      rite wait --reply-to <message-id> -t 300 --format json
+      rite wait --reply-to <message-id> --from reviewer -t 300
+
   Stream mentions and DMs (one process, all channels, JSONL)
 
       rite mentions follow --format json

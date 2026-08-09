@@ -345,6 +345,17 @@ pub enum Commands {
         #[arg(long)]
         from: Option<String>,
 
+        /// Wait for a reply to this message ID (acknowledgment). Narrows the
+        /// other filters rather than widening them. Exits 2 when the ID is not
+        /// a ULID or this store has never seen it.
+        #[arg(long = "reply-to", value_name = "MESSAGE_ID")]
+        reply_to: Option<String>,
+
+        /// With --reply-to, wait on a message this store has not seen yet
+        /// (it may still be syncing in) instead of exiting 2
+        #[arg(long, requires = "reply_to")]
+        allow_missing_parent: bool,
+
         /// Timeout in seconds (0 = no timeout)
         #[arg(short, long, default_value = "0")]
         timeout: u64,
