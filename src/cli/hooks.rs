@@ -157,6 +157,7 @@ pub fn add(
     let lease = lease.then_some(SpawnLease {
         ttl_secs: lease_ttl,
         max_batch,
+        extra: Default::default(),
     });
 
     let hook = Hook {
@@ -177,6 +178,7 @@ pub fn add(
         lease,
         active: true,
         description,
+        extra: Default::default(),
     };
 
     append_record(&hooks_path(), &hook).context("Failed to save hook")?;
@@ -1311,6 +1313,7 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                extra: Default::default(),
             },
             Hook {
                 id: "hk-abc".to_string(),
@@ -1332,6 +1335,7 @@ mod tests {
                 lease: None,
                 active: false, // Deactivated
                 description: None,
+                extra: Default::default(),
             },
         ];
 
@@ -1372,6 +1376,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         assert_eq!(hook_command_agent(&hook, "trigger-agent"), "worker-agent");
@@ -1399,6 +1404,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         assert_eq!(hook_command_agent(&hook, "trigger-agent"), "trigger-agent");
@@ -1504,6 +1510,7 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                extra: Default::default(),
             },
             Hook {
                 id: "hk-low".to_string(),
@@ -1525,6 +1532,7 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                extra: Default::default(),
             },
             Hook {
                 id: "hk-mid".to_string(),
@@ -1546,6 +1554,7 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                extra: Default::default(),
             },
         ];
 

@@ -1,7 +1,29 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use ulid::Ulid;
+
+/// Fields a build did not recognise, kept verbatim so a rewrite re-emits them.
+///
+/// `hooks.jsonl` and `hook-queue.jsonl` are append-only with
+/// latest-record-per-id wins, and several paths rewrite a *whole* record:
+/// the `last_fired` bump on every firing, `rite hooks remove`, the channel
+/// rename, and the queue entry's delivery mark. A build that predates a field
+/// deserializes the record without it and then appends a copy that omits it —
+/// so the newer configuration is deleted with no error, no warning, and no
+/// diagnostic. Forward-compatible *reading* does not help: the record parses
+/// fine, it just comes back short.
+///
+/// A `serde(flatten)` catch-all closes that. Anything this build cannot
+/// interpret lands here and is written back out unchanged, so a rewrite can
+/// only ever clobber fields the writer actually owns.
+///
+/// Declared **last** in every struct that carries one: flattened entries
+/// serialize at the position of the field, so keeping it last leaves the key
+/// order of a record with no unknown fields byte-identical to before. An
+/// empty map emits nothing at all.
+pub type UnknownFields = BTreeMap<String, serde_json::Value>;
 
 /// Reserved claim scheme for hook spawn leases.
 ///
@@ -47,7 +69,7 @@ pub fn spawn_lease_pattern(hook_id: &str, channel: &str) -> String {
 /// `crate::core::wire` corruption rules — and every field is optional, so an
 /// older rite ignores the whole thing and a newer one can add fields without
 /// making this build reject the record.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpawnLease {
     /// Seconds the lease may be held before it expires.
     /// Defaults to the hook's claim TTL, then [`DEFAULT_LEASE_TTL_SECS`].
@@ -59,6 +81,11 @@ pub struct SpawnLease {
     /// spawn after that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch: Option<usize>,
+
+    /// Lease settings this build does not know. See [`UnknownFields`].
+    /// Keep last.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
 }
 
 /// A hook trigger that arrived while the (hook, channel) spawn lease was
@@ -99,6 +126,11 @@ pub struct QueuedTrigger {
     /// handed this trigger.
     #[serde(default)]
     pub delivered: bool,
+
+    /// Queue-entry fields this build does not know, preserved across the
+    /// delivery rewrite. See [`UnknownFields`]. Keep last.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
 }
 
 impl QueuedTrigger {
@@ -118,6 +150,7 @@ impl QueuedTrigger {
             agent: agent.into(),
             dedup_key: dedup_key.into(),
             delivered: false,
+            extra: UnknownFields::new(),
         }
     }
 
@@ -207,6 +240,14 @@ pub struct Hook {
     /// Optional description for identification/deduplication
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Hook fields this build does not know, preserved across every rewrite
+    /// of the record. See [`UnknownFields`].
+    ///
+    /// Keep this field last, and add new named fields *above* it, so a hook
+    /// with nothing unknown still serializes exactly as it did before.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
 }
 
 /// How to release the claim acquired when a hook fires.
@@ -376,6 +417,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&hook).unwrap();
@@ -463,6 +505,7 @@ mod tests {
             lease,
             active: true,
             description: None,
+            extra: Default::default(),
         }
     }
 
@@ -481,6 +524,7 @@ mod tests {
         let explicit = lease_hook(Some(SpawnLease {
             ttl_secs: Some(120),
             max_batch: None,
+            extra: Default::default(),
         }));
         assert_eq!(explicit.lease_ttl_secs(), 120);
 
@@ -505,6 +549,7 @@ mod tests {
             lease_hook(Some(SpawnLease {
                 ttl_secs: None,
                 max_batch: Some(0),
+                extra: Default::default(),
             }))
             .lease_max_batch(),
             1
@@ -527,6 +572,7 @@ mod tests {
         let hook = lease_hook(Some(SpawnLease {
             ttl_secs: Some(900),
             max_batch: Some(10),
+            extra: Default::default(),
         }));
         let json = serde_json::to_string(&hook).unwrap();
         let parsed: Hook = serde_json::from_str(&json).unwrap();
@@ -534,7 +580,8 @@ mod tests {
             parsed.lease,
             Some(SpawnLease {
                 ttl_secs: Some(900),
-                max_batch: Some(10)
+                max_batch: Some(10),
+                extra: Default::default(),
             })
         );
     }
@@ -549,6 +596,69 @@ mod tests {
         assert!(hook.uses_lease());
         assert_eq!(hook.lease_ttl_secs(), 42);
         assert_eq!(hook.lease_max_batch(), DEFAULT_MAX_BATCH);
+
+        // Tolerating it is not enough — writing it back out is what stops a
+        // rewrite from deleting it.
+        let out: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&hook).unwrap()).unwrap();
+        assert_eq!(out["lease"]["steer_mode"], "inject");
+    }
+
+    /// The bn-14o5 defect: a firing rewrites the whole hook record, so a
+    /// field this build cannot interpret must come back out unchanged.
+    #[test]
+    fn test_unknown_hook_fields_survive_a_rewrite() {
+        let json = r#"{"id":"hk-fut","channel":"test","condition":{"type":"claim_available","pattern":"x"},"command":["echo"],"cwd":"/tmp","cooldown_secs":30,"created_at":"2025-01-01T00:00:00Z","active":true,"steer_mode":"inject","future_limits":{"max_depth":3}}"#;
+        let hook: Hook = serde_json::from_str(json).unwrap();
+        assert_eq!(hook.extra.len(), 2, "unknown fields must be captured");
+
+        // Exactly what a firing does: clone, bump last_fired, append.
+        let mut rewritten = hook.clone();
+        rewritten.last_fired = Some(Utc::now());
+        let out: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rewritten).unwrap()).unwrap();
+
+        assert_eq!(out["steer_mode"], "inject");
+        assert_eq!(out["future_limits"]["max_depth"], 3);
+        assert!(out["last_fired"].is_string());
+        assert!(
+            out.get("extra").is_none(),
+            "the catch-all must flatten, never appear as a key: {out}"
+        );
+    }
+
+    /// The catch-all takes leftover *fields*; it must not turn a record with
+    /// a missing or wrong-typed required field into a readable hook, or
+    /// `rite doctor` would stop reporting corruption.
+    #[test]
+    fn test_catch_all_does_not_accept_a_broken_record() {
+        // No `id`.
+        let missing = r#"{"channel":"test","condition":{"type":"claim_available","pattern":"x"},"command":["echo"],"cwd":"/tmp","cooldown_secs":30,"created_at":"2025-01-01T00:00:00Z","active":true}"#;
+        assert!(serde_json::from_str::<Hook>(missing).is_err());
+
+        // `command` is not a list of strings.
+        let wrong_type = r#"{"id":"hk-bad","channel":"test","condition":{"type":"claim_available","pattern":"x"},"command":"echo","cwd":"/tmp","cooldown_secs":30,"created_at":"2025-01-01T00:00:00Z","active":true}"#;
+        assert!(serde_json::from_str::<Hook>(wrong_type).is_err());
+    }
+
+    /// A hook with nothing unknown must serialize exactly as it did before
+    /// the catch-all existed — the guarantee every hook already on disk needs.
+    #[test]
+    fn test_catch_all_adds_nothing_when_empty() {
+        let json = serde_json::to_string(&lease_hook(None)).unwrap();
+        assert!(!json.contains("extra"), "{json}");
+        assert!(!json.contains("{}"), "{json}");
+    }
+
+    /// The queue entry is rewritten too, when a spawn is handed the trigger.
+    #[test]
+    fn test_unknown_queue_fields_survive_the_delivery_mark() {
+        let json = r#"{"ts":"2025-01-01T00:00:00Z","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","hook_id":"hk-abc","channel":"rite","message_id":"01ABC","agent":"sender","dedup_key":"deadbeef","priority":7}"#;
+        let entry: QueuedTrigger = serde_json::from_str(json).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&entry.delivered()).unwrap()).unwrap();
+        assert_eq!(out["priority"], 7);
+        assert_eq!(out["delivered"], true);
     }
 
     #[test]
@@ -616,6 +726,7 @@ mod tests {
             lease: None,
             active: true,
             description: Some("botbox:respond:general".to_string()),
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&hook).unwrap();
@@ -650,6 +761,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&hook).unwrap();
@@ -715,6 +827,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&hook).unwrap();
@@ -746,6 +859,7 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            extra: Default::default(),
         };
 
         let json = serde_json::to_string(&hook).unwrap();
