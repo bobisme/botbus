@@ -383,6 +383,53 @@ Agents communicate via rite channels. You don't need to be expert on everything 
 
 See [cross-channel.md](.agents/edict/cross-channel.md) for the full workflow.
 
+### Communication
+
+Use ASD-STE100 Simplified Technical English for prose. Strict compliance is not the goal. Aim for terse, unambiguous language.
+
+Do not apply STE to code, identifiers, commands, marketing copy, essays, or voice-driven writing.
+
+#### Language
+
+- Limit sentences to 20 words.
+- Replace semicolons and contractions.
+- Use active voice when the actor is known.
+- Use plain verbs. Avoid nominalization, phrasal verbs, and "-ing" main verbs.
+- Use one consistent name for each thing.
+
+#### rite messages
+
+Keep a channel message to one or two lines. Lead with the subject of the label. The label and the bone ID already carry the context, so do not add status blocks, numbered steps, or closing actions.
+
+- `[task-claim] Working on <bone-id>: <title>`
+- `[review-request] Review requested: <review-id> for <bone-id> @<reviewer>`
+- `[task-blocked] Blocked on <thing>: <what unblocks it>`
+
+#### Replies to a human
+
+1. Start with a concrete action. Put commands, paths, or snippets first.
+2. Number multistep tasks. Give each step one bounded action.
+3. Limit lists to five items. Split longer lists by priority.
+4. State the current step, what is complete, what remains, and what it waits on.
+5. End with the next action, or state what you wait on.
+
+Finish the current issue before you present another. State errors as evidence, cause, and fix.
+
+Do not use preambles, recaps, pleasantries, tangents, emotional error language, or empty hedges.
+
+Never state a time estimate you cannot support. You do not know how long a build, a test run, or another agent takes. Name what you wait on instead.
+
+#### Exceptions
+
+- Explain fully when the user asks for an explanation or a walkthrough.
+- Confirm before destructive actions.
+- After three failed fixes, state the uncertain assumption and ask one diagnostic question.
+- Ask one short question when real ambiguity makes a guess risky.
+
+Before you send, remove announcements, repeated summaries, sidebars, and empty closing questions.
+
+The first line must give the action. The last line must give the result or the next action.
+
 ### Session Search (optional)
 
 Use `cass search "error or problem"` to find how similar issues were solved in past sessions.
