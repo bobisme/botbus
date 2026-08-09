@@ -361,11 +361,11 @@ Agents communicate via rite channels. You don't need to be expert on everything 
 |-----------|---------|
 | Send message | `rite send --agent $AGENT <channel> "message" [-L label]` |
 | Check inbox | `rite inbox --agent $AGENT --channels <ch> [--mark-read]` |
-| Wait for reply | `rite wait -c <channel> --mention -t 120` |
+| Wait for reply | `rite wait --mentions --from <agent> -t 120` |
 | Browse history | `rite history <channel> -n 20` |
 | Search messages | `rite search "query" -c <channel>` |
 
-**Conversations**: After sending a question, use `rite wait -c <channel> --mention -t <seconds>` to block until the other agent replies. This enables back-and-forth conversations across channels.
+**Conversations**: After sending a question, use `rite wait --mentions --from <agent> -t <seconds>` to block until that agent replies. This enables back-and-forth conversations across channels.
 
 **Project experts**: Each `<project>-dev` is the expert on their project. When stuck on a companion tool (rite, maw, seal, vessel, bn), post a question to its project channel instead of guessing.
 
