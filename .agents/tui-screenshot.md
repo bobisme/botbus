@@ -52,15 +52,28 @@ failed to land.
 ## Regenerate the README image
 
 ```bash
-./scripts/screenshot-tui.sh           # 1200x800 to images/tui.png
+./scripts/screenshot-tui.sh           # 1200x800 to images/tui.webp
 ./scripts/screenshot-tui.sh 1600 900  # custom dimensions
 ```
 
-Requires kitty, grim, jq, pngquant, and **Hyprland**. The script spawns a
-floating window, captures it, and compresses the result.
+Requires kitty, jq, ImageMagick, and a running **niri** or **Hyprland** session
+(plus grim on Hyprland). The script floats a window at the requested size,
+captures it, and converts the result to webp.
 
-This is only for the README hero image. Do not reach for it to check your work —
-use `vessel` above.
+It picks the compositor from its IPC handle — `NIRI_SOCKET` or
+`HYPRLAND_INSTANCE_SIGNATURE` — rather than from which binaries are installed.
+`hyprctl` is frequently present on machines not running Hyprland, and it exits 0
+even when it cannot reach a compositor, so neither the binary nor its exit
+status tells you anything.
 
-> **Broken on niri.** The script drives window placement through `hyprctl`, so it
-> fails wherever Hyprland is not running. Tracked in `bn-b4ai`.
+With no compositor — headless, SSH, a sandbox — the script fails immediately and
+says so rather than erroring partway through. That is the normal case for an
+agent, and it is not a problem to work around: use `vessel` above.
+
+This is only for the README hero image. Do not reach for it to check your work.
+
+On niri, captures land in the directory from your `screenshot-path` setting in
+`~/.config/niri/config.kdl`, because niri chooses the filename rather than
+accepting one. The script moves the newest capture out of there, so that
+directory is left as it was found. If `screenshot-path` is `null`, nothing
+reaches disk and the script tells you to set one.
