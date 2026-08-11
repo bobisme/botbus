@@ -3,6 +3,49 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-08-11
+
+Threading, finished. 0.32.0 could record that a message answers another one;
+this release lets you block on that answer and read it as an answer.
+
+### Added
+
+- `rite wait --reply-to <id>` blocks until someone answers a specific message,
+  so a request no longer has to be posted and guessed about. Exit 0 means
+  answered, 1 means nobody replied inside the timeout, 2 means the id is not a
+  ULID or this store never saw it. `--reply-to` narrows rather than widens: it
+  names one question, and `--from`, `-c`, and `-L` only remove candidate
+  answers from it. Your own reply does not acknowledge you. A reply that landed
+  before the wait started is still reported, so there is no race between `rite
+  send` and `rite wait`. Use `--allow-missing-parent` when the parent is still
+  syncing in from another machine.
+- `rite ui` renders a reply as a reply. Replies indent under a connector,
+  carry a `↩ reply` badge, and show a one-line preview of the parent, so an
+  answer to a message far up the transcript reads as an answer rather than a
+  non-sequitur. Nesting is capped at four visual levels; deeper replies stay
+  legible and report their true depth. A parent that is missing, tombstoned, a
+  self-reference, or part of a cycle is badged as such instead of being drawn
+  as an ordinary reply.
+
+### Fixed
+
+- `scripts/screenshot-tui.sh` works under niri, and picks its compositor from
+  the IPC handle rather than from which binaries are installed — `hyprctl` is
+  frequently present on machines not running Hyprland, and it exits 0 even when
+  it cannot reach a compositor. With no supported compositor the script now
+  fails immediately and points at `vessel`. Output is converted with
+  ImageMagick to `images/tui.webp`, which is the file the README actually
+  references; the script previously wrote a `.png` nothing used.
+
+### Documentation
+
+- `.agents/tui-screenshot.md` separates the two jobs it used to conflate:
+  `vessel` verifies a TUI change and needs no compositor, so it works over SSH
+  and in sandboxes; `screenshot-tui.sh` exists only to regenerate the README
+  image. Includes the vessel command table, and the two failure modes that read
+  exactly like a change that did not land — a stale `target/release/rite`, and
+  a missing `RITE_DATA_DIR` pointing the TUI at the live hook fleet.
+
 ## [0.32.0] - 2026-08-09
 
 ### Added
