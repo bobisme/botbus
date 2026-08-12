@@ -65,7 +65,7 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 |---------|-------|
 | `agents` | `rite agents [--active]` |
 | `channels` | `rite channels list\|close\|reopen\|delete\|rename` |
-| `hooks` | `rite hooks add\|list\|remove\|test` |
+| `hooks` | `rite hooks add\|list\|set\|remove\|test` |
 | `subscriptions` | `rite subscriptions add\|remove\|list` |
 | `statuses` | `rite statuses set\|clear\|list` |
 | `messages` | `rite messages get <id>` |
@@ -152,6 +152,26 @@ so a reply in a DM counts. Your own reply does not acknowledge you. A reply
 that landed before the wait started is still reported, so there is no race
 between `rite send` and `rite wait`. Use `--allow-missing-parent` only when the
 parent is still syncing in from another machine.
+
+### Changing a Hook
+
+Change a hook in place. Do not remove and re-add it.
+
+```bash
+rite hooks set hk-abc --cwd /home/me/src/project   # repoint a moved project
+rite hooks set hk-abc --lease --lease-ttl 1800     # turn the spawn lease on
+rite hooks set hk-abc --no-lease                   # back to cooldown
+rite hooks set hk-abc -- vessel spawn ... -- edict run responder
+```
+
+Every field you do not name keeps its value, including fields this build does
+not understand.
+
+The hook ID is the spawn-lease key (`spawn://<id>/<channel>`). Remove-and-add
+issues a new ID, so a spawn that is still running holds a lease nobody checks
+any more and the replacement spawns a second agent beside it. It also clears
+`last_fired`, which hands a cooldown hook an immediate free firing, and it
+drops any field the person retyping the command did not know about.
 
 ### Message Flags
 

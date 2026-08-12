@@ -371,6 +371,233 @@ pub fn list(format: OutputFormat) -> Result<()> {
     Ok(())
 }
 
+/// What a single `hooks set` invocation changes. Every field is optional:
+/// `None` means "leave whatever the hook already has".
+///
+/// Bundled into a struct rather than passed as fifteen positional arguments
+/// so a caller cannot silently transpose two of them.
+#[derive(Debug, Default)]
+pub struct HookEdit {
+    pub channel: Option<String>,
+    pub claim: Option<String>,
+    pub mention: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub cooldown: Option<String>,
+    pub command: Vec<String>,
+    pub ttl: Option<u64>,
+    pub release_on_exit: bool,
+    pub claim_owner: Option<String>,
+    pub priority: Option<i32>,
+    pub require_flag: Option<String>,
+    pub description: Option<String>,
+    pub lease: bool,
+    pub no_lease: bool,
+    pub lease_ttl: Option<u64>,
+    pub max_batch: Option<usize>,
+}
+
+impl HookEdit {
+    /// Whether this edit asks for anything at all.
+    ///
+    /// An empty edit is rejected rather than appended: a no-op record would
+    /// still be a new latest-wins entry, which is noise in an append-only
+    /// log and makes `hooks set` look like it did something.
+    fn is_empty(&self) -> bool {
+        self.channel.is_none()
+            && self.claim.is_none()
+            && self.mention.is_none()
+            && self.cwd.is_none()
+            && self.cooldown.is_none()
+            && self.command.is_empty()
+            && self.ttl.is_none()
+            && !self.release_on_exit
+            && self.claim_owner.is_none()
+            && self.priority.is_none()
+            && self.require_flag.is_none()
+            && self.description.is_none()
+            && !self.lease
+            && !self.no_lease
+            && self.lease_ttl.is_none()
+            && self.max_batch.is_none()
+    }
+}
+
+/// Apply `edit` to `hook` in place, returning a human-readable list of what
+/// changed.
+///
+/// Split out from [`set`] so the merge rules are testable without touching
+/// the filesystem. Anything the edit does not mention is left exactly as it
+/// was — including `id`, `created_at`, `last_fired`, and `extra`, which is
+/// what makes this an update rather than a replacement.
+fn apply_edit(hook: &mut Hook, edit: &HookEdit) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+
+    if let Some(channel) = &edit.channel {
+        hook.channel = channel.clone();
+        changed.push(format!("channel -> #{channel}"));
+    }
+
+    // Condition. --mention wins the condition slot; a --claim alongside it
+    // becomes the explicit claim pattern, matching `hooks add`.
+    match (&edit.claim, &edit.mention) {
+        (_, Some(agent)) => {
+            let agent = agent.strip_prefix('@').unwrap_or(agent).to_string();
+            hook.condition = HookCondition::MentionReceived {
+                agent: agent.clone(),
+            };
+            hook.claim_pattern = edit.claim.clone();
+            changed.push(format!("condition -> mention @{agent}"));
+            if let Some(pattern) = &edit.claim {
+                changed.push(format!("claim pattern -> {pattern}"));
+            }
+        }
+        (Some(pattern), None) => {
+            hook.condition = HookCondition::ClaimAvailable {
+                pattern: pattern.clone(),
+            };
+            hook.claim_pattern = None;
+            changed.push(format!("condition -> claim available {pattern}"));
+        }
+        (None, None) => {}
+    }
+
+    if let Some(cwd) = &edit.cwd {
+        // The whole reason this command exists is repointing a hook whose cwd
+        // vanished, so a typo here must not be accepted quietly.
+        if !cwd.exists() {
+            bail!("Working directory does not exist: {}", cwd.display());
+        }
+        if !cwd.is_dir() {
+            bail!("Working directory is not a directory: {}", cwd.display());
+        }
+        hook.cwd = cwd.clone();
+        changed.push(format!("cwd -> {}", cwd.display()));
+    }
+
+    if !edit.command.is_empty() {
+        hook.command = edit.command.clone();
+        changed.push(format!("command -> {:?}", hook.command));
+    }
+
+    if let Some(cooldown) = &edit.cooldown {
+        hook.cooldown_secs = parse_cooldown(cooldown)?;
+        changed.push(format!("cooldown -> {}s", hook.cooldown_secs));
+    }
+
+    if edit.release_on_exit {
+        hook.claim_release = Some(ClaimRelease::OnExit);
+        changed.push("claim release -> on exit".to_string());
+    } else if let Some(secs) = edit.ttl {
+        hook.claim_release = Some(ClaimRelease::Ttl { secs });
+        changed.push(format!("claim release -> ttl {secs}s"));
+    }
+
+    if let Some(owner) = &edit.claim_owner {
+        hook.claim_owner = Some(owner.clone());
+        changed.push(format!("claim owner -> {owner}"));
+    }
+
+    if let Some(priority) = edit.priority {
+        hook.priority = priority;
+        changed.push(format!("priority -> {priority}"));
+    }
+
+    if let Some(flag) = &edit.require_flag {
+        hook.require_flag = Some(flag.to_lowercase());
+        changed.push(format!("require flag -> !{}", flag.to_lowercase()));
+    }
+
+    if let Some(description) = &edit.description {
+        hook.description = Some(description.clone());
+        changed.push(format!("description -> {description}"));
+    }
+
+    // Lease. --no-lease clears it; --lease turns it on; --lease-ttl and
+    // --max-batch tune an existing one without having to re-state --lease.
+    if edit.no_lease {
+        if hook.lease.take().is_some() {
+            changed.push(format!(
+                "lease -> off (cooldown {}s applies again)",
+                hook.cooldown_secs
+            ));
+        }
+    } else if edit.lease || edit.lease_ttl.is_some() || edit.max_batch.is_some() {
+        let existing = hook.lease.clone().unwrap_or_default();
+        let was_leased = hook.lease.is_some();
+        hook.lease = Some(SpawnLease {
+            // An unspecified knob keeps the value the lease already had, so
+            // `--lease-ttl` alone does not silently reset `--max-batch`.
+            ttl_secs: edit.lease_ttl.or(existing.ttl_secs),
+            max_batch: edit.max_batch.or(existing.max_batch),
+            extra: existing.extra,
+        });
+        if was_leased {
+            changed.push(format!(
+                "lease -> ttl {}s, max-batch {}",
+                hook.lease_ttl_secs(),
+                hook.lease_max_batch()
+            ));
+        } else {
+            changed.push(format!(
+                "lease -> on (ttl {}s, max-batch {}; cooldown now ignored)",
+                hook.lease_ttl_secs(),
+                hook.lease_max_batch()
+            ));
+        }
+    }
+
+    Ok(changed)
+}
+
+/// Update an existing hook in place, preserving its ID.
+///
+/// hooks.jsonl is append-only with latest-record-wins, so this appends an
+/// amended copy rather than mutating anything. Keeping the ID is the point:
+/// a hook's ID is its spawn-lease key (`spawn://<id>/<channel>`), so
+/// remove-then-add hands a running spawn's lease to nobody and lets the
+/// replacement spawn a second agent alongside it.
+pub fn set(hook_id: String, edit: &HookEdit, format: OutputFormat) -> Result<()> {
+    if edit.is_empty() {
+        bail!(
+            "Nothing to change. Pass at least one field, e.g.:\n  rite hooks set {hook_id} --cwd /path/to/project"
+        );
+    }
+
+    let all_hooks: Vec<Hook> = read_records(&hooks_path()).unwrap_or_default();
+    let active = build_active_hooks(&all_hooks);
+
+    let hook = active
+        .get(&hook_id)
+        .ok_or_else(|| anyhow::anyhow!("Hook not found: {}", hook_id))?;
+
+    // Clone the stored record so every field this build does not know about
+    // rides along untouched. See `UnknownFields` / bn-14o5.
+    let mut updated = hook.clone();
+    let changed = apply_edit(&mut updated, edit)?;
+
+    append_record(&hooks_path(), &updated).context("Failed to update hook")?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&updated)?);
+        }
+        OutputFormat::Pretty | OutputFormat::Text => {
+            println!("{} Hook {} updated", "Updated:".green(), hook_id.cyan());
+            for line in &changed {
+                println!("  {line}");
+            }
+            if updated.uses_lease() {
+                println!(
+                    "  lease pattern: {}",
+                    updated.lease_pattern(&updated.channel)
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Remove (deactivate) a hook by ID.
 pub fn remove(hook_id: String, format: OutputFormat) -> Result<()> {
     let all_hooks: Vec<Hook> = read_records(&hooks_path()).unwrap_or_default();

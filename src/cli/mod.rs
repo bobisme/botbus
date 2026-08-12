@@ -612,6 +612,87 @@ pub enum HooksCommands {
     /// List all active hooks
     List,
 
+    /// Change fields on an existing hook, keeping its ID
+    ///
+    /// Every unspecified field keeps its current value. The hook ID is
+    /// preserved, which matters because the ID is the spawn-lease key
+    /// (`spawn://<id>/<channel>`) — removing and re-adding a hook orphans the
+    /// lease a running spawn holds and lets the replacement spawn alongside it.
+    ///
+    ///   rite hooks set hk-abc --cwd /home/me/src/project
+    ///   rite hooks set hk-abc --lease --lease-ttl 1800
+    ///   rite hooks set hk-abc --no-lease
+    Set {
+        /// Hook ID to update (e.g., "hk-abc")
+        hook_id: String,
+
+        /// Channel that triggers this hook
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Claim pattern — acquire this claim when the hook fires
+        #[arg(long)]
+        claim: Option<String>,
+
+        /// Agent mention — fire when this agent is @mentioned
+        #[arg(long)]
+        mention: Option<String>,
+
+        /// Working directory for the command
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+
+        /// Cooldown between firings (e.g., "30s", "5m", "1h").
+        /// Ignored while the hook holds a lease.
+        #[arg(long)]
+        cooldown: Option<String>,
+
+        /// Turn the spawn lease on
+        #[arg(long, conflicts_with = "no_lease")]
+        lease: bool,
+
+        /// Turn the spawn lease off, restoring cooldown behaviour
+        #[arg(long, conflicts_with = "lease")]
+        no_lease: bool,
+
+        /// Seconds a spawn lease may be held before it lapses.
+        /// Implies the hook is leased; no need to repeat --lease.
+        #[arg(long, conflicts_with = "no_lease")]
+        lease_ttl: Option<u64>,
+
+        /// Maximum triggers handed to a single spawn
+        #[arg(long, conflicts_with = "no_lease")]
+        max_batch: Option<usize>,
+
+        /// Claim TTL in seconds
+        #[arg(long, conflicts_with = "release_on_exit")]
+        ttl: Option<u64>,
+
+        /// Release the claim when the spawned command exits
+        #[arg(long, conflicts_with = "ttl")]
+        release_on_exit: bool,
+
+        /// Agent that should own the claim
+        #[arg(long)]
+        claim_owner: Option<String>,
+
+        /// Priority for hook execution (lower runs first)
+        #[arg(long)]
+        priority: Option<i32>,
+
+        /// Only fire this hook if the message contains the specified !flag
+        #[arg(long)]
+        require_flag: Option<String>,
+
+        /// Description for identification/deduplication
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Replacement command (place after --). Omit to keep the current one.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
     /// Remove (deactivate) a hook
     Remove {
         /// Hook ID to remove (e.g., "hk-abc")
