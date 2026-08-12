@@ -3,6 +3,58 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-08-12
+
+Hooks you can change without destroying, and a doctor that notices when one
+cannot possibly run.
+
+### Changed
+
+- **`rite history` hides system messages by default.** Hook firings, agent
+  registrations, and claim expiries are withheld unless you pass
+  `--show-system`. On a busy channel these are a fifth to nearly half of every
+  read: measured over the last 500 messages, `#console` was 44% hook-fired
+  system lines, `#wraith` 33%, `#maw` 21%, `#rite` 18%. Nothing is hidden
+  silently — text output ends with `N system messages hidden (--show-system)`,
+  and JSON carries `hidden_system` plus an `advice` entry. `-n` counts readable
+  messages, and `--from system` and `--thread` include them without the flag.
+  Claim records are deliberately not treated as system messages: they are the
+  entire content of `#claims`.
+- **`rite ui` hides system messages by default**, matching `history`. `ctrl+h`
+  brings them back. That toggle no longer hides claim records, so `#claims`
+  does not open on an empty screen.
+- `rite hooks add --name <key>` now **updates** an existing hook with that name
+  on that channel instead of creating a second one. Nothing passes `--name`
+  yet, so no existing hook changes behaviour.
+
+### Added
+
+- `rite hooks set <id>` changes a hook in place, keeping its ID. Every field
+  you do not name keeps its value, including fields this build does not
+  understand. Previously any change meant `hooks remove` followed by
+  `hooks add`, which is not an equivalent operation: the hook ID is the
+  spawn-lease key (`spawn://<id>/<channel>`), so a new ID leaves a running
+  spawn holding a lease nobody checks and lets the replacement spawn a second
+  agent beside it. It also cleared `last_fired`, handing a cooldown hook an
+  immediate free firing, and dropped any field the caller did not re-type.
+- `rite hooks add --name` and `--owner`, giving a hook a stable identity an
+  external tool can converge on, plus `rite hooks list --owner <tool>`.
+  A converge preserves anything it does not name — including the lease — so a
+  manager that has never heard of `--lease` can no longer strip one. Turning a
+  lease off stays deliberate: `rite hooks set <id> --no-lease`.
+- `rite doctor` reports hooks that cannot run: a `cwd` that no longer exists,
+  or a command that is not on PATH. Warning, not failure, since a hook for a
+  project checked out on another machine is legitimate. Eight of forty-two
+  live hooks were in this state while doctor reported a healthy environment;
+  one had fired against a deleted directory 228 times. A firing that fails to
+  spawn records `executed: false`, exactly like a cooldown skip, so nothing
+  else distinguishes a dead hook from a quiet one.
+- `rite doctor` reports a data directory whose git store is broken. Sync
+  commits into that repository on every write, so a corrupt store means every
+  commit fails silently while the JSONL — the actual source of truth — stays
+  correct. That went unnoticed for about 2.5 days after an unclean shutdown,
+  with doctor reporting healthy throughout.
+
 ## [0.33.0] - 2026-08-11
 
 Threading, finished. 0.32.0 could record that a message answers another one;
