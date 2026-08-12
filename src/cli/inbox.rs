@@ -134,6 +134,11 @@ pub fn run(options: InboxOptions, explicit_agent: Option<&str>) -> Result<()> {
             after_id,
             thread: None,
             show_offset: false,
+            // Unchanged on purpose. `inbox` drives unread counts and
+            // `--mark-read`, so hiding records here would silently change what
+            // "unread" means. Whether the inbox should filter too is a
+            // separate decision from how `history` reads.
+            show_system: true,
             format: OutputFormat::Text,
             agent: Some(agent.clone()),
         };

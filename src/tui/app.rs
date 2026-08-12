@@ -149,7 +149,11 @@ impl App {
             dragging_sidebar_split: false,
             agents_height: None,
             maximized: false,
-            hide_system_messages: false,
+            // Hidden by default, matching `rite history`. On a busy channel
+            // this is a fifth to nearly half of every screen, and it is never
+            // what someone opened the channel to read. ctrl+h brings it back,
+            // and the footer says so.
+            hide_system_messages: true,
         };
 
         app.update_new_message_counts();
@@ -1171,17 +1175,18 @@ mod tests {
         }
 
         let mut app = App::new(None).unwrap();
+        // Hidden by default, matching `rite history`.
+        assert!(app.hide_system_messages());
+
+        // Toggle off — bring the bookkeeping back
+        app.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL)
+            .unwrap();
         assert!(!app.hide_system_messages());
 
-        // Toggle on
+        // Toggle on again
         app.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL)
             .unwrap();
         assert!(app.hide_system_messages());
-
-        // Toggle off
-        app.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL)
-            .unwrap();
-        assert!(!app.hide_system_messages());
 
         unsafe {
             env::remove_var(DATA_DIR_ENV_VAR);

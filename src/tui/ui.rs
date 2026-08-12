@@ -768,18 +768,16 @@ fn preview_text(body: &str, max_chars: usize) -> String {
     }
 }
 
+/// Whether ctrl+h hides this message.
+///
+/// Delegates to `Message::is_system` so the TUI and `rite history` cannot
+/// drift apart about what a channel contains.
+///
+/// This used to also cover claim, release, and claim-extension records. It no
+/// longer does: 34,209 of the 34,313 such records live in `#claims`, so with
+/// hiding now on by default that channel would open empty.
 fn is_system_message(msg: &crate::core::message::Message) -> bool {
-    use crate::core::message::MessageMeta;
-
-    matches!(
-        &msg.meta,
-        Some(
-            MessageMeta::System { .. }
-                | MessageMeta::Claim { .. }
-                | MessageMeta::ClaimExtended { .. }
-                | MessageMeta::Release { .. }
-        )
-    )
+    msg.is_system()
 }
 
 /// Format a system message with lightning bolt glyph and dim italic styling.
@@ -1142,12 +1140,36 @@ mod tests {
     use super::is_system_message;
     use crate::core::message::{Message, MessageMeta};
 
+    /// Claim bookkeeping is **not** hidden, which reverses what this test
+    /// asserted before hiding became the default.
+    ///
+    /// It used to be folded in with system messages, which was harmless while
+    /// ctrl+h defaulted to showing everything. Now that both the TUI and
+    /// `rite history` hide by default, folding it in would open `#claims` —
+    /// 34,209 of the 34,313 claim records live there — on an empty screen.
     #[test]
-    fn treats_claim_extensions_as_system_messages() {
+    fn does_not_treat_claim_extensions_as_system_messages() {
         let msg = Message::new("botbox-dev", "claims", "Claim extended").with_meta(
             MessageMeta::ClaimExtended {
                 patterns: vec!["agent://botbox-dev".to_string()],
                 ttl_secs: 600,
+            },
+        );
+
+        assert!(!is_system_message(&msg));
+    }
+
+    /// A hook firing is what the filter exists for.
+    #[test]
+    fn treats_hook_firings_as_system_messages() {
+        use crate::core::message::SystemEvent;
+
+        let msg = Message::new("system", "rite", "Hook hk-abc fired: vessel spawn").with_meta(
+            MessageMeta::System {
+                event: SystemEvent::HookFired {
+                    hook_id: "hk-abc".to_string(),
+                    command: vec!["vessel".to_string(), "spawn".to_string()],
+                },
             },
         );
 

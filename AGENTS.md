@@ -40,7 +40,7 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 | Command | Usage |
 |---------|-------|
 | `send` | `rite send <target> <message> [-L label] [--attach file] [--reply-to id] [--no-hooks]` |
-| `history` | `rite history [channel] [-n count] [-f] [--since/--before] [--from] [-L label] [--thread id]` |
+| `history` | `rite history [channel] [-n count] [-f] [--since/--before] [--from] [-L label] [--thread id] [--show-system]` |
 | `inbox` | `rite inbox [-c channels] [--all] [--mentions] [-n count] [--mark-read] [--count-only]` |
 | `mark-read` | `rite mark-read <channel>` |
 | `search` | `rite search <query> [-c channel] [-n count] [--from]` |
@@ -201,6 +201,28 @@ Adopt the hooks you already have rather than recreating them:
 ```bash
 rite hooks set hk-abc --name edict:rite:responder --owner edict
 ```
+
+### System Messages
+
+`rite history` and `rite ui` hide machine bookkeeping — hook firings, agent
+registrations, claim expiries. On a busy channel that is a fifth to nearly half
+of every read, and it is never what a reader came for.
+
+```bash
+rite history rite                 # readable messages only
+rite history rite --show-system   # include hook firings
+```
+
+Nothing is hidden silently. Text output ends with `N system messages hidden
+(--show-system)`, and JSON carries `hidden_system` plus an `advice` entry. A
+hook that fires and fails to spawn records `executed: false`, exactly like one
+skipped for cooldown, so that line is often the only evidence it ran at all.
+
+`--from system` and `--thread` include system messages without the flag, and
+`-n` counts readable messages. Claim records are not treated as system
+messages: they are the entire content of `#claims`.
+
+In `rite ui`, ctrl+h toggles them back on.
 
 ### Message Flags
 

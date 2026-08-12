@@ -476,6 +476,21 @@ impl Message {
             _ => None,
         }
     }
+
+    /// Whether this is machine bookkeeping rather than something an agent
+    /// said — a hook firing, an agent registering, a claim expiring.
+    ///
+    /// Deliberately **not** every message that carries `meta`. Claim, release,
+    /// and claim-extension records are also machine-written, but they are the
+    /// entire content of `#claims`: 34,209 of the 34,313 such records live
+    /// there. Folding them in would make `rite history claims` return an
+    /// almost empty channel, which is the opposite of useful.
+    ///
+    /// One definition, shared by `rite history` and the TUI, so the two
+    /// surfaces cannot disagree about what a channel looks like.
+    pub fn is_system(&self) -> bool {
+        matches!(&self.meta, Some(MessageMeta::System { .. }))
+    }
 }
 
 /// Read messages from a JSONL file, filtering out deleted messages and their tombstones.

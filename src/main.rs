@@ -136,6 +136,7 @@ fn main() -> Result<()> {
             after_id,
             thread,
             show_offset,
+            show_system,
             format: local_format,
         } => cli::history::run(cli::history::HistoryOptions {
             channel: channel.or(channel_named),
@@ -151,6 +152,7 @@ fn main() -> Result<()> {
             after_id,
             thread,
             show_offset,
+            show_system,
             // Use local format if provided, otherwise default to Text for history
             format: if cli.json {
                 OutputFormat::Json

@@ -38,6 +38,9 @@ pub struct HistoryOptions {
     pub thread: Option<String>,
     /// Show the offset info for next read
     pub show_offset: bool,
+    /// Include machine bookkeeping (hook firings, agent registrations).
+    /// Hidden by default: it is a fifth to nearly half of a busy channel.
+    pub show_system: bool,
     /// Output format
     pub format: OutputFormat,
     /// Agent identity (for resolving @mentions in channel names)
@@ -60,6 +63,16 @@ pub struct HistoryOutput {
     pub thread: Option<ThreadInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub advice: Vec<String>,
+    /// System messages withheld from `messages` by the default filter.
+    ///
+    /// Omitted when zero, so a read with nothing hidden serializes exactly as
+    /// it did before this existed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub hidden_system: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Shape of the thread returned by `--thread`.
@@ -224,6 +237,21 @@ pub fn run(options: HistoryOptions) -> Result<()> {
                 }
             }
 
+            // Say what was withheld. A hook that fired and failed to spawn
+            // leaves only this trace, so hiding it without a word is how a
+            // broken hook goes unnoticed.
+            if output.hidden_system > 0 {
+                let n = output.hidden_system;
+                println!(
+                    "{}",
+                    format!(
+                        "{n} system message{} hidden (--show-system)",
+                        if n == 1 { "" } else { "s" }
+                    )
+                    .dimmed()
+                );
+            }
+
             // Follow mode
             if options.follow {
                 let path = channel_path(&channel);
@@ -271,6 +299,7 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
             next_offset: 0,
             last_id: None,
             total_available: 0,
+            hidden_system: 0,
             thread: None,
             advice: vec![],
         });
@@ -303,11 +332,24 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
     };
 
     // Read messages based on options
-    let (messages, next_offset) = if let Some(offset) = start_offset {
+    let show_system = wants_system(&options);
+    let (messages, next_offset, hidden_system) = if let Some(offset) = start_offset {
         // Bounded read from a byte offset; next_offset is a valid continuation
-        // cursor whether or not the result hit the count limit.
-        read_messages_from_offset_limited(&path, offset, options.count)
-            .with_context(|| format!("Failed to read channel #{} from offset", channel))?
+        // cursor whether or not the result hit the count limit. Filtering here
+        // can return fewer than `count`, which is fine — the cursor, not the
+        // count, is what paginates an offset read.
+        let (msgs, next) = read_messages_from_offset_limited(&path, offset, options.count)
+            .with_context(|| format!("Failed to read channel #{} from offset", channel))?;
+        if show_system {
+            (msgs, next, 0)
+        } else {
+            let hidden = msgs.iter().filter(|m| m.is_system()).count();
+            (
+                msgs.into_iter().filter(|m| !m.is_system()).collect(),
+                next,
+                hidden,
+            )
+        }
     } else if options.since.is_some()
         || options.before.is_some()
         || options.from.is_some()
@@ -316,12 +358,13 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
         // Need to filter, read all and filter
         let all: Vec<Message> =
             read_messages(&path).with_context(|| format!("Failed to read channel #{}", channel))?;
-        (filter_messages(all, &options), file_size)
+        let (msgs, hidden) = filter_messages(all, &options);
+        (msgs, file_size, hidden)
     } else {
         // Just get last N
-        let msgs = read_last_n_messages(&path, options.count)
+        let (msgs, hidden) = read_last_n_visible(&path, options.count, show_system)
             .with_context(|| format!("Failed to read channel #{}", channel))?;
-        (msgs, file_size)
+        (msgs, file_size, hidden)
     };
 
     let total_available = messages.len();
@@ -330,6 +373,12 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
     // Build advice. For offset-based reads, more messages remain when the
     // continuation cursor hasn't reached EOF yet.
     let mut advice = Vec::new();
+    if hidden_system > 0 {
+        advice.push(format!(
+            "{hidden_system} system message{} hidden; --show-system to include",
+            if hidden_system == 1 { "" } else { "s" }
+        ));
+    }
     if start_offset.is_some() && next_offset < file_size {
         advice.push(format!(
             "rite history {} --after-offset {}",
@@ -345,6 +394,7 @@ pub fn run_with_output(options: HistoryOptions) -> Result<HistoryOutput> {
         total_available,
         thread: None,
         advice,
+        hidden_system,
     })
 }
 
@@ -473,12 +523,101 @@ fn read_thread(
         last_id,
         thread: Some(info),
         advice,
+        // A thread is shown whole; nothing is withheld from it.
+        hidden_system: 0,
     })
 }
 
-fn filter_messages(messages: Vec<Message>, options: &HistoryOptions) -> Vec<Message> {
+/// Read the last `count` *visible* messages, plus how many system messages
+/// were hidden among them.
+///
+/// The tail read has to over-read: asking for the last 20 lines of a channel
+/// that is 40% hook noise yields 12 readable ones. Widening the window and
+/// retrying keeps `-n` meaningful without reading the whole file, which
+/// matters because `#claims` is 7.9MB / 34k lines and contains almost no
+/// system messages — it would pay the entire cost of a scan for nothing.
+fn read_last_n_visible(
+    path: &std::path::Path,
+    count: usize,
+    show_system: bool,
+) -> Result<(Vec<Message>, usize)> {
+    if show_system {
+        return Ok((read_last_n_messages(path, count)?, 0));
+    }
+
+    let mut window = count.max(1);
+    loop {
+        let msgs = read_last_n_messages(path, window)?;
+        // Fewer than asked for means the window reached the start of the
+        // file, so widening again cannot find more.
+        let exhausted = msgs.len() < window;
+
+        let visible: Vec<usize> = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| !m.is_system())
+            .map(|(i, _)| i)
+            .collect();
+
+        if visible.len() >= count || exhausted {
+            // Start at the oldest message we are actually returning, so the
+            // hidden tally describes the span the caller sees rather than the
+            // whole over-read window.
+            let start = if visible.len() > count {
+                visible[visible.len() - count]
+            } else {
+                0
+            };
+            let hidden = msgs[start..].iter().filter(|m| m.is_system()).count();
+            let kept = msgs
+                .into_iter()
+                .skip(start)
+                .filter(|m| !m.is_system())
+                .collect();
+            return Ok((kept, hidden));
+        }
+
+        window = window.saturating_mul(4);
+    }
+}
+
+/// Whether this read should include machine bookkeeping.
+///
+/// Asking for it by any route implies showing it. `--from system` that
+/// returned nothing would be absurd, and a thread is a conversation the
+/// caller named explicitly — silently dropping part of it would misrepresent
+/// what was said.
+fn wants_system(options: &HistoryOptions) -> bool {
+    options.show_system
+        || options.thread.is_some()
+        || options.from.as_deref().is_some_and(|from| from == "system")
+}
+
+/// Apply every filter, returning the messages and how many system messages
+/// were hidden.
+///
+/// The hidden count is not decoration. A hook that fires and fails to spawn
+/// is indistinguishable from one skipped for cooldown — both record
+/// `executed: false` — so the system line is often the only surviving trace
+/// that anything happened at all. Dropping it without a word is how a broken
+/// hook stays broken for weeks.
+fn filter_messages(messages: Vec<Message>, options: &HistoryOptions) -> (Vec<Message>, usize) {
+    let show_system = wants_system(options);
+    let mut hidden = 0usize;
+
     let mut filtered: Vec<Message> = messages
         .into_iter()
+        .filter(|msg| {
+            // Machine bookkeeping, unless it was asked for. Counted before
+            // the other filters so the tally reflects what the caller would
+            // otherwise have seen.
+            if !show_system && msg.is_system() {
+                hidden += 1;
+                return false;
+            }
+
+            true
+        })
         .filter(|msg| {
             // Filter by sender
             if let Some(from) = &options.from
@@ -512,10 +651,11 @@ fn filter_messages(messages: Vec<Message>, options: &HistoryOptions) -> Vec<Mess
         })
         .collect();
 
-    // Limit to count (take last N after filtering)
+    // Limit to count (take last N after filtering), so `-n 20` means twenty
+    // readable messages rather than twenty rows of which some vanished.
     let start = filtered.len().saturating_sub(options.count);
     filtered.drain(..start);
-    filtered
+    (filtered, hidden)
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
@@ -916,6 +1056,7 @@ mod tests {
             after_id: None,
             thread: None,
             show_offset: false,
+            show_system: true,
             format: OutputFormat::Text,
             agent: None,
         };
@@ -942,6 +1083,7 @@ mod tests {
             after_id: None,
             thread: None,
             show_offset: false,
+            show_system: true,
             format: OutputFormat::Text,
             agent: None,
         };
@@ -986,6 +1128,7 @@ mod tests {
             after_id: None,
             thread: None,
             show_offset: false,
+            show_system: true,
             format: OutputFormat::Text,
             agent: None,
         };
@@ -1037,6 +1180,7 @@ mod tests {
             after_id: None,
             thread: None,
             show_offset: false,
+            show_system: true,
             format: OutputFormat::Text,
             agent: None,
         };

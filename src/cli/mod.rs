@@ -207,6 +207,13 @@ pub enum Commands {
         #[arg(long)]
         show_offset: bool,
 
+        /// Include machine bookkeeping — hook firings, agent registrations,
+        /// claim expiries. Hidden by default: on a busy channel it is a fifth
+        /// to nearly half of every read. `--from system` and `--thread` show
+        /// it without this flag.
+        #[arg(long)]
+        show_system: bool,
+
         /// Output format (default: text for history)
         #[arg(long, value_enum)]
         format: Option<OutputFormat>,
