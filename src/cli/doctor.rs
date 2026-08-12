@@ -11,6 +11,7 @@ use std::path::Path;
 
 use super::OutputFormat;
 use crate::core::claim::FileClaim;
+use crate::core::hook::Hook;
 use crate::core::identity::resolve_agent;
 use crate::core::message::Message;
 use crate::core::names::is_valid_name;
@@ -19,7 +20,7 @@ use crate::core::project::{
     statuses_path,
 };
 use crate::core::status::AgentStatusEntry;
-use crate::storage::jsonl::{DamagedField, ScanIssues, scan_issues};
+use crate::storage::jsonl::{DamagedField, ScanIssues, read_records, scan_issues};
 use crate::sync::git;
 
 /// How many skipped-line details to show before truncating.
@@ -174,6 +175,12 @@ pub fn run(format: OutputFormat) -> Result<()> {
 
     // Check 9: JSONL records this build cannot read (mixed-version sync)
     check_record_readability(&mut report);
+
+    // Check 10: hooks that cannot possibly run (dead cwd, missing command)
+    check_hooks_runnable(&mut report);
+
+    // Check 11: the data directory's git store still works
+    check_data_repo_git(&mut report);
 
     // Build advice based on failed/warned checks
     for check in &report.checks {
@@ -588,6 +595,148 @@ fn check_git_available(report: &mut DoctorReport) {
                 "Install git to use sync features (rite sync init/push/pull)".to_string(),
             ),
         });
+    }
+}
+
+/// Whether `program` can actually be executed.
+///
+/// A path with a separator is taken as written; a bare name is looked up on
+/// PATH, the same way the spawn will resolve it.
+fn command_resolves(program: &str) -> bool {
+    let candidate = std::path::Path::new(program);
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        return candidate.is_file();
+    }
+
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let full = dir.join(program);
+                full.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Flag hooks that cannot possibly run.
+///
+/// A hook whose `cwd` was deleted, or whose command is not on PATH, still
+/// fires on every matching message: it stakes its claim, fails to spawn,
+/// releases, and records `executed: false` — which is exactly what a
+/// cooldown skip records. Nothing distinguishes the two, so a hook can be
+/// dead for weeks without a single visible symptom. Eight of forty-two live
+/// hooks were found in that state on 2026-08-12; one had accumulated 228
+/// audit entries.
+///
+/// Warn rather than fail. A hook for a project checked out on another machine
+/// is legitimate, and doctor exits non-zero on failure.
+fn check_hooks_runnable(report: &mut DoctorReport) {
+    let all_hooks: Vec<Hook> = read_records(&hooks_path()).unwrap_or_default();
+    let active = crate::cli::hooks::build_active_hooks(&all_hooks);
+
+    let mut broken: Vec<String> = Vec::new();
+    for hook in active.values() {
+        if !hook.cwd.is_dir() {
+            broken.push(format!(
+                "{} (#{}) cwd missing: {}",
+                hook.id,
+                hook.channel,
+                hook.cwd.display()
+            ));
+            continue;
+        }
+        if let Some(program) = hook.command.first()
+            && !command_resolves(program)
+        {
+            broken.push(format!(
+                "{} (#{}) command not found: {}",
+                hook.id, hook.channel, program
+            ));
+        }
+    }
+
+    if broken.is_empty() {
+        report.add(Check {
+            name: "hooks_runnable".to_string(),
+            status: CheckStatus::Pass,
+            message: format!("All {} hook(s) can run", active.len()),
+            suggestion: None,
+        });
+        return;
+    }
+
+    let shown: Vec<String> = broken.iter().take(MAX_SKIPPED_DETAILS).cloned().collect();
+    let mut message = format!(
+        "{} of {} hook(s) cannot run: {}",
+        broken.len(),
+        active.len(),
+        shown.join("; ")
+    );
+    if broken.len() > shown.len() {
+        message.push_str(&format!(" (+{} more)", broken.len() - shown.len()));
+    }
+
+    report.add(Check {
+        name: "hooks_runnable".to_string(),
+        status: CheckStatus::Warn,
+        message,
+        suggestion: Some(
+            "Repoint with `rite hooks set <id> --cwd <path>`, or remove with \
+             `rite hooks remove <id>`. A hook for a project on another machine is fine."
+                .to_string(),
+        ),
+    });
+}
+
+/// Flag a data directory whose git store is broken.
+///
+/// Sync commits into this repository on every write. When the store is
+/// corrupt every commit fails silently, so the JSONL stays correct — it is
+/// the source of truth — while the history stops being recorded. That went
+/// unnoticed for about 2.5 days after an unclean shutdown on 2026-07-06,
+/// with doctor reporting a healthy environment throughout, because nothing
+/// asked git whether it could still read its own HEAD.
+fn check_data_repo_git(report: &mut DoctorReport) {
+    let dir = data_dir();
+    if !dir.join(".git").exists() {
+        // Sync is opt-in. Not having a repo is not a problem.
+        return;
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "rev-parse", "HEAD"])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            report.add(Check {
+                name: "data_repo_git".to_string(),
+                status: CheckStatus::Pass,
+                message: "Data directory git store is readable".to_string(),
+                suggestion: None,
+            });
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            report.add(Check {
+                name: "data_repo_git".to_string(),
+                status: CheckStatus::Fail,
+                message: format!("Data directory git store is broken: {err}"),
+                suggestion: Some(format!(
+                    "Messages are safe — the JSONL files are the source of truth — but sync \
+                     commits are failing silently. Inspect with `git -C {} status`.",
+                    dir.display()
+                )),
+            });
+        }
+        Err(e) => {
+            report.add(Check {
+                name: "data_repo_git".to_string(),
+                status: CheckStatus::Warn,
+                message: format!("Could not run git in the data directory: {e}"),
+                suggestion: None,
+            });
+        }
     }
 }
 

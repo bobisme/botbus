@@ -870,7 +870,7 @@ pub fn test(hook_id: String, format: OutputFormat) -> Result<()> {
 }
 
 /// Build a map of active hooks (latest state per ID wins).
-fn build_active_hooks(all_hooks: &[Hook]) -> HashMap<String, Hook> {
+pub(crate) fn build_active_hooks(all_hooks: &[Hook]) -> HashMap<String, Hook> {
     let mut map: HashMap<String, Hook> = HashMap::new();
     for hook in all_hooks {
         map.insert(hook.id.clone(), hook.clone());
