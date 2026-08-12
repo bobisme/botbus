@@ -604,13 +604,31 @@ pub enum HooksCommands {
         #[arg(long)]
         description: Option<String>,
 
+        /// Stable key for this hook, unique per channel.
+        ///
+        /// Adding again with the same name updates the existing hook instead
+        /// of creating a second one, keeping its ID — and therefore its spawn
+        /// lease. Fields you do not pass keep their current values, so a
+        /// converge cannot silently strip configuration it does not know
+        /// about. Use `hooks set --no-lease` to turn a lease off deliberately.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Tool that manages this hook (e.g. "edict"), for `hooks list --owner`
+        #[arg(long)]
+        owner: Option<String>,
+
         /// Command to execute (place after --)
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
 
     /// List all active hooks
-    List,
+    List {
+        /// Only show hooks managed by this owner
+        #[arg(long)]
+        owner: Option<String>,
+    },
 
     /// Change fields on an existing hook, keeping its ID
     ///
@@ -687,6 +705,14 @@ pub enum HooksCommands {
         /// Description for identification/deduplication
         #[arg(long)]
         description: Option<String>,
+
+        /// Stable key for this hook, unique per channel
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Tool that manages this hook (e.g. "edict")
+        #[arg(long)]
+        owner: Option<String>,
 
         /// Replacement command (place after --). Omit to keep the current one.
         #[arg(last = true)]

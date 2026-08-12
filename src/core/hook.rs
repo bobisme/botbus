@@ -241,6 +241,27 @@ pub struct Hook {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Stable key for a hook an external tool manages, unique per channel.
+    ///
+    /// `hooks add --name` converges onto the existing record instead of
+    /// creating a second hook, which is what lets a manager like edict keep a
+    /// hook up to date without destroying it. That matters because the hook
+    /// ID is the spawn-lease key ([`Hook::lease_pattern`]): remove-and-add
+    /// orphans the lease a running spawn holds.
+    ///
+    /// `None` for every hook registered before this field existed. Those keep
+    /// the old create-every-time behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Tool that manages this hook, for bulk queries (`hooks list --owner`).
+    ///
+    /// Ownership is advisory. rite does not stop anyone from editing a hook
+    /// another tool owns — it only makes "which hooks are mine" answerable
+    /// without parsing a naming convention out of the description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+
     /// Hook fields this build does not know, preserved across every rewrite
     /// of the record. See [`UnknownFields`].
     ///
@@ -417,6 +438,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -505,6 +528,8 @@ mod tests {
             lease,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         }
     }
@@ -726,6 +751,8 @@ mod tests {
             lease: None,
             active: true,
             description: Some("botbox:respond:general".to_string()),
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -761,6 +788,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -827,6 +856,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -859,6 +890,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 

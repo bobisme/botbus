@@ -65,7 +65,7 @@ All commands support `--agent <name>` (or `RITE_AGENT` env var), `--format toon|
 |---------|-------|
 | `agents` | `rite agents [--active]` |
 | `channels` | `rite channels list\|close\|reopen\|delete\|rename` |
-| `hooks` | `rite hooks add\|list\|set\|remove\|test` |
+| `hooks` | `rite hooks add [--name --owner]\|list [--owner]\|set\|remove\|test` |
 | `subscriptions` | `rite subscriptions add\|remove\|list` |
 | `statuses` | `rite statuses set\|clear\|list` |
 | `messages` | `rite messages get <id>` |
@@ -172,6 +172,35 @@ issues a new ID, so a spawn that is still running holds a lease nobody checks
 any more and the replacement spawns a second agent beside it. It also clears
 `last_fired`, which hands a cooldown hook an immediate free firing, and it
 drops any field the person retyping the command did not know about.
+
+### Managing Hooks From Another Tool
+
+A tool that registers hooks (edict, a setup script) gives each one a stable
+`--name` and re-runs the same `hooks add` to converge it.
+
+```bash
+rite hooks add --name edict:rite:responder --owner edict \
+  --channel rite --mention rite-dev --cwd /home/me/src/rite \
+  -- vessel spawn --name rite-responder --cwd /home/me/src/rite -- edict run responder
+
+rite hooks list --owner edict     # every hook that tool manages
+```
+
+A name is unique per channel. Adding again with the same name updates that
+hook and keeps its ID. **Whatever the converge does not name keeps its current
+value** — including the lease. So a manager that has never heard of `--lease`
+cannot strip one, which is how a leased hook previously reverted to cooldown
+without a word.
+
+Turning a lease off is therefore deliberate: `rite hooks set <id> --no-lease`.
+`--priority` carries a default of 0, so a converge treats 0 as "unspecified";
+use `hooks set --priority 0` to actually set it back to zero.
+
+Adopt the hooks you already have rather than recreating them:
+
+```bash
+rite hooks set hk-abc --name edict:rite:responder --owner edict
+```
 
 ### Message Flags
 

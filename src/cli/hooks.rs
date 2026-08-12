@@ -64,6 +64,8 @@ pub fn add(
     lease: bool,
     lease_ttl: Option<u64>,
     max_batch: Option<usize>,
+    name: Option<String>,
+    owner: Option<String>,
     agent: Option<&str>,
     format: OutputFormat,
 ) -> Result<()> {
@@ -131,10 +133,64 @@ pub fn add(
 
     // Load existing hooks to check for ID collisions
     let existing_hooks: Vec<Hook> = read_records(&hooks_path()).unwrap_or_default();
-    let existing_ids: Vec<String> = build_active_hooks(&existing_hooks)
-        .values()
-        .map(|h| h.id.clone())
-        .collect();
+    let active_hooks = build_active_hooks(&existing_hooks);
+    let existing_ids: Vec<String> = active_hooks.values().map(|h| h.id.clone()).collect();
+
+    // A named hook that already exists on this channel is converged, not
+    // duplicated. Preserving the record — and therefore the ID — is the whole
+    // point: the ID is the spawn-lease key, so remove-and-add leaves a
+    // running spawn holding a lease nobody checks any more.
+    if let Some(ref hook_name) = name
+        && let Some(existing) = active_hooks
+            .values()
+            .find(|h| h.name.as_deref() == Some(hook_name.as_str()) && h.channel == hook_channel)
+    {
+        let mut updated = (*existing).clone();
+        let edit = HookEdit {
+            channel: None,
+            claim: claim.clone(),
+            mention: mention.clone(),
+            cwd: Some(cwd),
+            cooldown,
+            command,
+            ttl,
+            release_on_exit,
+            claim_owner,
+            // `--priority` carries a clap default, so it cannot say "leave it
+            // alone". Treat the default as unspecified on the converge path.
+            priority: (priority != 0).then_some(priority),
+            require_flag,
+            description,
+            // Absent `--lease` means "this caller said nothing about
+            // leasing", never "turn leasing off". A converge that silently
+            // dropped the lease is exactly the bn-20eh failure. Use
+            // `hooks set --no-lease` to turn one off deliberately.
+            lease,
+            no_lease: false,
+            lease_ttl,
+            max_batch,
+            name: None,
+            owner,
+        };
+        let changed = apply_edit(&mut updated, &edit)?;
+        append_record(&hooks_path(), &updated).context("Failed to update hook")?;
+
+        match format {
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&updated)?),
+            OutputFormat::Pretty | OutputFormat::Text => {
+                println!(
+                    "{} Hook {} updated ({})",
+                    "Converged:".green(),
+                    updated.id.cyan(),
+                    hook_name
+                );
+                for line in &changed {
+                    println!("  {line}");
+                }
+            }
+        }
+        return Ok(());
+    }
 
     // Set claim_release when --claim is used (required for claim hooks, optional otherwise)
     let claim_release = if has_claim {
@@ -178,6 +234,8 @@ pub fn add(
         lease,
         active: true,
         description,
+        name,
+        owner,
         extra: Default::default(),
     };
 
@@ -237,6 +295,10 @@ struct HookInfo {
     require_flag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
     last_fired: Option<String>,
     /// Spawn lease config, when the hook uses one instead of `cooldown_secs`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,11 +316,14 @@ struct HooksOutput {
 }
 
 /// List all active hooks.
-pub fn list(format: OutputFormat) -> Result<()> {
+pub fn list(owner: Option<&str>, format: OutputFormat) -> Result<()> {
     let all_hooks: Vec<Hook> = read_records(&hooks_path()).unwrap_or_default();
     let active = build_active_hooks(&all_hooks);
 
-    let mut hooks: Vec<&Hook> = active.values().collect();
+    let mut hooks: Vec<&Hook> = active
+        .values()
+        .filter(|h| owner.is_none_or(|want| h.owner.as_deref() == Some(want)))
+        .collect();
     hooks.sort_by_key(|h| &h.created_at);
 
     // Pending counts make a wedged lease visible: a hook whose queue only
@@ -280,6 +345,8 @@ pub fn list(format: OutputFormat) -> Result<()> {
             priority: h.priority,
             require_flag: h.require_flag.clone(),
             description: h.description.clone(),
+            name: h.name.clone(),
+            owner: h.owner.clone(),
             last_fired: h.last_fired.map(|t| t.to_rfc3339()),
             lease: h.lease.clone(),
             pending: *pending_counts.get(&h.id).unwrap_or(&0),
@@ -394,6 +461,8 @@ pub struct HookEdit {
     pub no_lease: bool,
     pub lease_ttl: Option<u64>,
     pub max_batch: Option<usize>,
+    pub name: Option<String>,
+    pub owner: Option<String>,
 }
 
 impl HookEdit {
@@ -419,6 +488,8 @@ impl HookEdit {
             && !self.no_lease
             && self.lease_ttl.is_none()
             && self.max_batch.is_none()
+            && self.name.is_none()
+            && self.owner.is_none()
     }
 }
 
@@ -510,6 +581,16 @@ fn apply_edit(hook: &mut Hook, edit: &HookEdit) -> Result<Vec<String>> {
     if let Some(description) = &edit.description {
         hook.description = Some(description.clone());
         changed.push(format!("description -> {description}"));
+    }
+
+    if let Some(name) = &edit.name {
+        hook.name = Some(name.clone());
+        changed.push(format!("name -> {name}"));
+    }
+
+    if let Some(owner) = &edit.owner {
+        hook.owner = Some(owner.clone());
+        changed.push(format!("owner -> {owner}"));
     }
 
     // Lease. --no-lease clears it; --lease turns it on; --lease-ttl and
@@ -1540,6 +1621,8 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                name: None,
+                owner: None,
                 extra: Default::default(),
             },
             Hook {
@@ -1562,6 +1645,8 @@ mod tests {
                 lease: None,
                 active: false, // Deactivated
                 description: None,
+                name: None,
+                owner: None,
                 extra: Default::default(),
             },
         ];
@@ -1603,6 +1688,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -1631,6 +1718,8 @@ mod tests {
             lease: None,
             active: true,
             description: None,
+            name: None,
+            owner: None,
             extra: Default::default(),
         };
 
@@ -1737,6 +1826,8 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                name: None,
+                owner: None,
                 extra: Default::default(),
             },
             Hook {
@@ -1759,6 +1850,8 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                name: None,
+                owner: None,
                 extra: Default::default(),
             },
             Hook {
@@ -1781,6 +1874,8 @@ mod tests {
                 lease: None,
                 active: true,
                 description: None,
+                name: None,
+                owner: None,
                 extra: Default::default(),
             },
         ];
