@@ -89,7 +89,7 @@ fn set(project: &TestProject, hook_id: &str, args: &[&str]) -> common::RiteOutpu
 /// The point of the command: the ID survives, so the lease key survives.
 #[test]
 fn test_set_preserves_hook_id() {
-    let mut project = TestProject::with_name("hook-set-id");
+    let project = TestProject::with_name("hook-set-id");
     let hook_id = add_hook(&project, &["--lease", "--lease-ttl", "1800"]);
 
     set(&project, &hook_id, &["--priority", "5"]).assert_success();
@@ -116,7 +116,7 @@ fn test_set_preserves_hook_id() {
 /// was only meant to refresh the command.
 #[test]
 fn test_set_preserves_lease_when_not_mentioned() {
-    let mut project = TestProject::with_name("hook-set-keeps-lease");
+    let project = TestProject::with_name("hook-set-keeps-lease");
     let hook_id = add_hook(
         &project,
         &["--lease", "--lease-ttl", "1800", "--max-batch", "7"],
@@ -141,7 +141,7 @@ fn test_set_preserves_lease_when_not_mentioned() {
 /// Tuning one lease knob must not reset the other.
 #[test]
 fn test_lease_ttl_alone_keeps_max_batch() {
-    let mut project = TestProject::with_name("hook-set-lease-knobs");
+    let project = TestProject::with_name("hook-set-lease-knobs");
     let hook_id = add_hook(
         &project,
         &["--lease", "--lease-ttl", "600", "--max-batch", "9"],
@@ -161,7 +161,7 @@ fn test_lease_ttl_alone_keeps_max_batch() {
 /// cooldown hook does not require repeating `--lease`.
 #[test]
 fn test_lease_ttl_enables_lease_on_cooldown_hook() {
-    let mut project = TestProject::with_name("hook-set-lease-implied");
+    let project = TestProject::with_name("hook-set-lease-implied");
     let hook_id = add_hook(&project, &["--cooldown", "30s"]);
 
     assert!(
@@ -178,7 +178,7 @@ fn test_lease_ttl_enables_lease_on_cooldown_hook() {
 /// `--no-lease` restores cooldown behaviour.
 #[test]
 fn test_no_lease_clears_the_lease() {
-    let mut project = TestProject::with_name("hook-set-no-lease");
+    let project = TestProject::with_name("hook-set-no-lease");
     let hook_id = add_hook(&project, &["--lease", "--lease-ttl", "1800"]);
 
     set(&project, &hook_id, &["--no-lease"]).assert_success();
@@ -194,7 +194,7 @@ fn test_no_lease_clears_the_lease() {
 /// hand-retyped `hooks add` is most likely to get wrong.
 #[test]
 fn test_unspecified_fields_are_untouched() {
-    let mut project = TestProject::with_name("hook-set-untouched");
+    let project = TestProject::with_name("hook-set-untouched");
     let hook_id = add_hook(
         &project,
         &[
@@ -247,7 +247,7 @@ fn test_unspecified_fields_are_untouched() {
 /// hook last ran.
 #[test]
 fn test_last_fired_survives_an_edit() {
-    let mut project = TestProject::with_name("hook-set-last-fired");
+    let project = TestProject::with_name("hook-set-last-fired");
     let hook_id = add_hook(&project, &[]);
 
     // Plant a firing time rather than waiting for a real one — this test is
@@ -277,7 +277,7 @@ fn test_last_fired_survives_an_edit() {
 /// becomes a new way to reintroduce bn-14o5.
 #[test]
 fn test_unknown_fields_survive_an_edit() {
-    let mut project = TestProject::with_name("hook-set-unknown-fields");
+    let project = TestProject::with_name("hook-set-unknown-fields");
     let hook_id = add_hook(&project, &["--lease"]);
 
     // Append a record as a *newer* rite that had grown these fields.
@@ -311,7 +311,7 @@ fn test_unknown_fields_survive_an_edit() {
 /// command is most likely to be used to fix, so it must not be accepted.
 #[test]
 fn test_set_rejects_missing_cwd() {
-    let mut project = TestProject::with_name("hook-set-bad-cwd");
+    let project = TestProject::with_name("hook-set-bad-cwd");
     let hook_id = add_hook(&project, &[]);
     let before = latest_record(&project, &hook_id);
 
@@ -333,7 +333,7 @@ fn test_set_rejects_missing_cwd() {
 /// An edit that asks for nothing is a mistake, not a no-op append.
 #[test]
 fn test_empty_edit_is_rejected() {
-    let mut project = TestProject::with_name("hook-set-empty");
+    let project = TestProject::with_name("hook-set-empty");
     let hook_id = add_hook(&project, &[]);
     let before = hook_lines(&project).len();
 
@@ -348,7 +348,7 @@ fn test_empty_edit_is_rejected() {
 
 #[test]
 fn test_set_unknown_hook_fails() {
-    let mut project = TestProject::with_name("hook-set-missing");
+    let project = TestProject::with_name("hook-set-missing");
     add_hook(&project, &[]);
 
     let result = set(&project, "hk-nope", &["--priority", "1"]);
@@ -359,7 +359,7 @@ fn test_set_unknown_hook_fails() {
 /// `--env-inherit` list needs.
 #[test]
 fn test_set_replaces_command() {
-    let mut project = TestProject::with_name("hook-set-command");
+    let project = TestProject::with_name("hook-set-command");
     let hook_id = add_hook(&project, &[]);
 
     set(&project, &hook_id, &["--", "sh", "-c", "echo replaced"]).assert_success();
